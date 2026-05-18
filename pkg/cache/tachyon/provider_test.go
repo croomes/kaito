@@ -77,11 +77,12 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws)
+	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// 4 StorageIntercept env vars (no RUNAI_MODEL_URI since BlobEndpoint is empty in default config)
 	if len(mutations.EnvVars) != 4 {
 		t.Fatalf("expected 4 env vars for model weights, got %d", len(mutations.EnvVars))
 	}
@@ -104,6 +105,52 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 	}
 }
 
+func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
+	scheme := runtime.NewScheme()
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{
+			cacheGVR: "CacheList",
+		})
+	cfg := DefaultConfig()
+	cfg.BlobEndpoint = "https://myaccount.blob.core.windows.net"
+	cfg.BlobContainer = "models"
+	p := New(client, cfg)
+
+	ws := &kaitov1beta1.Workspace{
+		Cache: &kaitov1beta1.CacheSpec{
+			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+				Provider: "tachyon",
+				Mode:     kaitov1beta1.CacheModeOpportunistic,
+			},
+		},
+	}
+
+	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "abc123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 4 StorageIntercept env vars + 1 RUNAI_MODEL_URI
+	if len(mutations.EnvVars) != 5 {
+		t.Fatalf("expected 5 env vars, got %d", len(mutations.EnvVars))
+	}
+
+	// Find and verify RUNAI_MODEL_URI
+	var found bool
+	for _, env := range mutations.EnvVars {
+		if env.Name == "RUNAI_MODEL_URI" {
+			found = true
+			expected := "https://myaccount.blob.core.windows.net/models/kaito-models/microsoft/phi-4/abc123"
+			if env.Value != expected {
+				t.Errorf("RUNAI_MODEL_URI: expected %q, got %q", expected, env.Value)
+			}
+		}
+	}
+	if !found {
+		t.Error("RUNAI_MODEL_URI env var not found")
+	}
+}
+
 func TestPodMutations_KVCacheOnly(t *testing.T) {
 	p := newFakeProvider()
 	ws := &kaitov1beta1.Workspace{
@@ -115,7 +162,7 @@ func TestPodMutations_KVCacheOnly(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws)
+	mutations, err := p.PodMutations(context.Background(), ws, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -155,7 +202,7 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws)
+	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,7 +228,7 @@ func TestPodMutations_DisabledMode(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws)
+	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -195,7 +242,7 @@ func TestPodMutations_NilCache(t *testing.T) {
 	p := newFakeProvider()
 	ws := &kaitov1beta1.Workspace{}
 
-	mutations, err := p.PodMutations(context.Background(), ws)
+	mutations, err := p.PodMutations(context.Background(), ws, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

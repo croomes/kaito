@@ -41,12 +41,27 @@ type PodMutations struct {
 type PrewarmRequest struct {
 	// ModelName is the model identifier (e.g., "microsoft/phi-4").
 	ModelName string
+	// ModelRevision is the model revision (commit hash or "main").
+	ModelRevision string
 	// ModelSource is the registry or repository path for model weights.
 	ModelSource string
+	// ModelAccessSecret is the name of the K8s Secret containing the HF token.
+	ModelAccessSecret string
 	// ModelFiles optionally lists specific weight files to prewarm.
 	// If empty, the provider should prewarm all files for the model.
 	ModelFiles []string
 }
+
+// PrewarmPhase represents the status of a prewarm operation.
+type PrewarmPhase string
+
+const (
+	PrewarmPhasePending   PrewarmPhase = "Pending"
+	PrewarmPhaseRunning   PrewarmPhase = "Running"
+	PrewarmPhaseSucceeded PrewarmPhase = "Succeeded"
+	PrewarmPhaseFailed    PrewarmPhase = "Failed"
+	PrewarmPhaseUnknown   PrewarmPhase = "Unknown"
+)
 
 // Provider defines the interface that cache implementations must satisfy.
 // Each provider handles the specifics of its cache backend while KAITO's
@@ -64,8 +79,10 @@ type Provider interface {
 	IsReady(ctx context.Context) (bool, string, error)
 
 	// PodMutations returns the pod-level changes needed to enable cache
-	// access for a given workspace (env vars, volumes, mounts, init containers).
-	PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace) (*PodMutations, error)
+	// access for a given workspace and model (env vars, volumes, mounts, init containers).
+	// The modelName and modelRevision are used by providers that need to derive
+	// model-specific paths (e.g., blob storage paths for model weight caching).
+	PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*PodMutations, error)
 
 	// Prewarm triggers cache population for the specified model.
 	// Can be called by the workspace controller (on deploy with prewarmOnDeploy)
@@ -76,3 +93,4 @@ type Provider interface {
 	// Cleanup invalidates cached data for the specified model.
 	Cleanup(ctx context.Context, req PrewarmRequest) error
 }
+

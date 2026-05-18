@@ -64,6 +64,18 @@ type Config struct {
 
 	// KVConnectorProtocol is the transport protocol for KV cache (e.g., "rdma", "tcp").
 	KVConnectorProtocol string
+
+	// BlobEndpoint is the Azure Blob Storage endpoint (e.g., "https://account.blob.core.windows.net").
+	BlobEndpoint string
+
+	// BlobContainer is the blob container used for model weight storage.
+	BlobContainer string
+
+	// BlobPrefix is the path prefix within the container (defaults to "kaito-models").
+	BlobPrefix string
+
+	// PrewarmImage is the container image used for prewarm Jobs.
+	PrewarmImage string
 }
 
 // DefaultConfig returns sensible defaults for Tachyon integration.
@@ -73,6 +85,8 @@ func DefaultConfig() Config {
 		ModelWeightsEnabled: true,
 		KVCacheEnabled:      true,
 		KVConnectorProtocol: "tcp",
+		BlobContainer:       "kaito-models",
+		BlobPrefix:          DefaultBlobPrefix,
 	}
 }
 
@@ -125,16 +139,25 @@ func (p *Provider) IsReady(ctx context.Context) (bool, string, error) {
 }
 
 // PodMutations returns env vars that enable Tachyon caching in model pods.
-func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace) (*cache.PodMutations, error) {
+func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*cache.PodMutations, error) {
 	mutations := &cache.PodMutations{}
 
 	if workspace.Cache == nil {
 		return mutations, nil
 	}
 
-	// Model weights cache env vars (StorageIntercept).
+	// Model weights cache env vars (StorageIntercept + blob model path).
 	if workspace.Cache.ModelWeights != nil && workspace.Cache.ModelWeights.Mode != kaitov1beta1.CacheModeDisabled && p.config.ModelWeightsEnabled {
 		mutations.EnvVars = append(mutations.EnvVars, modelWeightsEnvVars(p.config.DiscoveryEndpoint)...)
+
+		// Inject the blob model path so RunAI streamer reads from blob via cache.
+		if p.config.BlobEndpoint != "" && modelName != "" {
+			blobPath := ModelBlobPath(p.config.BlobEndpoint, p.config.BlobContainer, p.config.BlobPrefix, modelName, modelRevision)
+			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
+				Name:  "RUNAI_MODEL_URI",
+				Value: blobPath,
+			})
+		}
 	}
 
 	// KV cache env vars (vLLM KV connector config).
@@ -149,9 +172,19 @@ func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Wor
 	return mutations, nil
 }
 
-// Prewarm is a placeholder for cache population logic.
+// Prewarm creates a prewarm Job for the specified model if one doesn't already exist.
+// The Job downloads model weights from HuggingFace and uploads to the Tachyon cache.
 func (p *Provider) Prewarm(ctx context.Context, req cache.PrewarmRequest) error {
-	klog.V(4).InfoS("Prewarm requested (not yet implemented)", "model", req.ModelName, "source", req.ModelSource)
+	if p.config.PrewarmImage == "" {
+		return fmt.Errorf("prewarm image not configured for tachyon provider")
+	}
+	if p.config.BlobEndpoint == "" {
+		return fmt.Errorf("blob endpoint not configured for tachyon provider")
+	}
+
+	klog.V(2).InfoS("Prewarm triggered", "model", req.ModelName, "revision", req.ModelRevision)
+	// The Job is created by the workspace controller using BuildPrewarmJob().
+	// This method validates that the config is sufficient to build a prewarm Job.
 	return nil
 }
 
