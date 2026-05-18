@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -56,10 +58,10 @@ type Config struct {
 	// DiscoveryEndpoint overrides the default cache server discovery endpoint.
 	DiscoveryEndpoint string
 
-	// ModelWeights controls whether model weight caching is supported.
+	// ModelWeightsEnabled controls whether model weight caching is supported.
 	ModelWeightsEnabled bool
 
-	// KVCache controls whether KV caching is supported.
+	// KVCacheEnabled controls whether KV caching is supported.
 	KVCacheEnabled bool
 
 	// KVConnectorProtocol is the transport protocol for KV cache (e.g., "rdma", "tcp").
@@ -68,25 +70,52 @@ type Config struct {
 	// BlobEndpoint is the Azure Blob Storage endpoint (e.g., "https://account.blob.core.windows.net").
 	BlobEndpoint string
 
+	// BlobStorageAccountName is the Azure storage account name.
+	// If empty, it is extracted from BlobEndpoint.
+	BlobStorageAccountName string
+
 	// BlobContainer is the blob container used for model weight storage.
 	BlobContainer string
 
 	// BlobPrefix is the path prefix within the container (defaults to "kaito-models").
 	BlobPrefix string
 
+	// StorageInterceptImage is the container image that contains libStorageIntercept.so.
+	// An init container copies the library from this image into a shared volume.
+	StorageInterceptImage string
+
+	// StorageInterceptLibPath is the path to libStorageIntercept.so within the StorageInterceptImage.
+	StorageInterceptLibPath string
+
 	// PrewarmImage is the container image used for prewarm Jobs.
 	PrewarmImage string
 }
 
+const (
+	// DefaultStorageInterceptImage is the default image containing libStorageIntercept.so.
+	DefaultStorageInterceptImage = "tachyontestacr.azurecr.io/cache-client-base:latest"
+
+	// DefaultStorageInterceptLibPath is the default path to the .so in the SI image.
+	DefaultStorageInterceptLibPath = "/lib/libStorageIntercept.so"
+
+	// cacheLibVolumeName is the shared volume for Tachyon client libraries (SI + KV).
+	cacheLibVolumeName = "tachyon-lib"
+
+	// cacheLibMountPath is where Tachyon libraries are mounted in the inference container.
+	cacheLibMountPath = "/opt/tachyon"
+)
+
 // DefaultConfig returns sensible defaults for Tachyon integration.
 func DefaultConfig() Config {
 	return Config{
-		DiscoveryEndpoint:   DefaultDiscoveryEndpoint,
-		ModelWeightsEnabled: true,
-		KVCacheEnabled:      true,
-		KVConnectorProtocol: "tcp",
-		BlobContainer:       "kaito-models",
-		BlobPrefix:          DefaultBlobPrefix,
+		DiscoveryEndpoint:       DefaultDiscoveryEndpoint,
+		ModelWeightsEnabled:     true,
+		KVCacheEnabled:          true,
+		KVConnectorProtocol:     "tcp",
+		BlobContainer:           "kaito-models",
+		BlobPrefix:              DefaultBlobPrefix,
+		StorageInterceptImage:   DefaultStorageInterceptImage,
+		StorageInterceptLibPath: DefaultStorageInterceptLibPath,
 	}
 }
 
@@ -138,7 +167,10 @@ func (p *Provider) IsReady(ctx context.Context) (bool, string, error) {
 	return ready, reason, nil
 }
 
-// PodMutations returns env vars that enable Tachyon caching in model pods.
+// PodMutations returns the pod-level changes needed to enable Tachyon caching.
+// For model weights: injects an init container (copies libStorageIntercept.so),
+// shared volume, LD_PRELOAD, StorageIntercept config env vars, and KAITO_MODEL_PATH.
+// For KV cache: injects the vLLM KV transfer config env var.
 func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*cache.PodMutations, error) {
 	mutations := &cache.PodMutations{}
 
@@ -146,16 +178,51 @@ func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Wor
 		return mutations, nil
 	}
 
-	// Model weights cache env vars (StorageIntercept + blob model path).
+	// Model weights cache: StorageIntercept library + config.
 	if workspace.Cache.ModelWeights != nil && workspace.Cache.ModelWeights.Mode != kaitov1beta1.CacheModeDisabled && p.config.ModelWeightsEnabled {
-		mutations.EnvVars = append(mutations.EnvVars, modelWeightsEnvVars(p.config.DiscoveryEndpoint)...)
+		siImage := p.config.StorageInterceptImage
+		if siImage == "" {
+			siImage = DefaultStorageInterceptImage
+		}
+		siLibPath := p.config.StorageInterceptLibPath
+		if siLibPath == "" {
+			siLibPath = DefaultStorageInterceptLibPath
+		}
 
-		// Inject the blob model path so vLLM loads from blob storage via cache.
-		if p.config.BlobEndpoint != "" && modelName != "" {
-			blobPath := ModelBlobPath(p.config.BlobEndpoint, p.config.BlobContainer, p.config.BlobPrefix, modelName, modelRevision)
+		// Init container: copy libStorageIntercept.so to shared volume.
+		mutations.InitContainers = append(mutations.InitContainers, corev1.Container{
+			Name:    "tachyon-lib-loader",
+			Image:   siImage,
+			Command: []string{"cp", siLibPath, cacheLibMountPath + "/libStorageIntercept.so"},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: cacheLibVolumeName, MountPath: cacheLibMountPath},
+			},
+		})
+
+		// Shared emptyDir volume for the library.
+		mutations.Volumes = append(mutations.Volumes, corev1.Volume{
+			Name: cacheLibVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+
+		// Mount the library volume into the inference container.
+		mutations.VolumeMounts = append(mutations.VolumeMounts, corev1.VolumeMount{
+			Name:      cacheLibVolumeName,
+			MountPath: cacheLibMountPath,
+			ReadOnly:  true,
+		})
+
+		// StorageIntercept env vars.
+		mutations.EnvVars = append(mutations.EnvVars, storageInterceptEnvVars(p.config)...)
+
+		// Model local path (the path vLLM will use as --model).
+		if modelName != "" {
+			localPath := ModelLocalPath(DefaultStoragePath, p.config.BlobPrefix, modelName, modelRevision)
 			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
-				Name:  "MODEL_BLOB_URI",
-				Value: blobPath,
+				Name:  "KAITO_MODEL_PATH",
+				Value: localPath,
 			})
 		}
 	}
@@ -194,14 +261,42 @@ func (p *Provider) Cleanup(ctx context.Context, req cache.PrewarmRequest) error 
 	return nil
 }
 
-// modelWeightsEnvVars returns the env vars needed for StorageIntercept.
-func modelWeightsEnvVars(discoveryEndpoint string) []corev1.EnvVar {
+// storageInterceptEnvVars returns the env vars needed to configure StorageIntercept.
+// These tell SI where to intercept filesystem reads and how to reach blob + cache.
+func storageInterceptEnvVars(cfg Config) []corev1.EnvVar {
+	accountName := cfg.BlobStorageAccountName
+	if accountName == "" {
+		accountName = extractAccountName(cfg.BlobEndpoint)
+	}
+
 	return []corev1.EnvVar{
-		{Name: "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", Value: "1"},
+		{Name: "LD_PRELOAD", Value: cacheLibMountPath + "/libStorageIntercept.so"},
+		{Name: "SI_storagePath", Value: DefaultStoragePath},
+		{Name: "SI_type", Value: "blob"},
+		{Name: "SI_azBlobStorageAccountName", Value: accountName},
+		{Name: "SI_azBlobStorageEndpoint", Value: cfg.BlobEndpoint},
+		{Name: "SI_azBlobContainerName", Value: cfg.BlobContainer},
 		{Name: "SI_cacheEnable", Value: "true"},
 		{Name: "SI_cacheServerDiscoveryEnabled", Value: "true"},
-		{Name: "SI_cacheServerDiscoveryEndpoint", Value: discoveryEndpoint},
+		{Name: "SI_cacheServerDiscoveryEndpoint", Value: cfg.DiscoveryEndpoint},
 	}
+}
+
+// extractAccountName extracts the storage account name from a blob endpoint URL.
+// For "https://myaccount.blob.core.windows.net", returns "myaccount".
+func extractAccountName(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(u.Hostname(), ".", 2)
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return ""
 }
 
 // kvTransferConfig is the JSON structure expected by vLLM's --kv-transfer-config flag.

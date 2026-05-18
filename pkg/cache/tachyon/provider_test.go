@@ -82,16 +82,48 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 4 StorageIntercept env vars (no MODEL_BLOB_URI since BlobEndpoint is empty in default config)
-	if len(mutations.EnvVars) != 4 {
-		t.Fatalf("expected 4 env vars for model weights, got %d", len(mutations.EnvVars))
+	// Init container for SI library injection.
+	if len(mutations.InitContainers) != 1 {
+		t.Fatalf("expected 1 init container, got %d", len(mutations.InitContainers))
+	}
+	if mutations.InitContainers[0].Name != "tachyon-lib-loader" {
+		t.Errorf("init container name: got %q, want %q", mutations.InitContainers[0].Name, "tachyon-lib-loader")
+	}
+	if mutations.InitContainers[0].Image != DefaultStorageInterceptImage {
+		t.Errorf("init container image: got %q, want %q", mutations.InitContainers[0].Image, DefaultStorageInterceptImage)
 	}
 
+	// Shared volume for SI library.
+	if len(mutations.Volumes) != 1 {
+		t.Fatalf("expected 1 volume, got %d", len(mutations.Volumes))
+	}
+	if mutations.Volumes[0].Name != "tachyon-lib" {
+		t.Errorf("volume name: got %q, want %q", mutations.Volumes[0].Name, "tachyon-lib")
+	}
+
+	// Volume mount for SI library.
+	if len(mutations.VolumeMounts) != 1 {
+		t.Fatalf("expected 1 volume mount, got %d", len(mutations.VolumeMounts))
+	}
+	if mutations.VolumeMounts[0].MountPath != "/opt/tachyon" {
+		t.Errorf("volume mount path: got %q, want %q", mutations.VolumeMounts[0].MountPath, "/opt/tachyon")
+	}
+
+	// Env vars: 9 SI config + 1 KAITO_MODEL_PATH = 10 (BlobEndpoint is empty, but account name will be empty string)
 	expectedEnvs := map[string]string{
-		"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED": "1",
-		"SI_cacheEnable":                    "true",
-		"SI_cacheServerDiscoveryEnabled":    "true",
-		"SI_cacheServerDiscoveryEndpoint":   DefaultDiscoveryEndpoint,
+		"LD_PRELOAD":                       "/opt/tachyon/libStorageIntercept.so",
+		"SI_storagePath":                   "/mnt/models",
+		"SI_type":                          "blob",
+		"SI_azBlobStorageAccountName":      "",
+		"SI_azBlobStorageEndpoint":         "",
+		"SI_azBlobContainerName":           "kaito-models",
+		"SI_cacheEnable":                   "true",
+		"SI_cacheServerDiscoveryEnabled":   "true",
+		"SI_cacheServerDiscoveryEndpoint":  DefaultDiscoveryEndpoint,
+		"KAITO_MODEL_PATH":                "/mnt/models/kaito-models/microsoft/phi-4/main",
+	}
+	if len(mutations.EnvVars) != len(expectedEnvs) {
+		t.Fatalf("expected %d env vars, got %d: %v", len(expectedEnvs), len(mutations.EnvVars), mutations.EnvVars)
 	}
 	for _, env := range mutations.EnvVars {
 		expected, ok := expectedEnvs[env.Name]
@@ -130,24 +162,44 @@ func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 4 StorageIntercept env vars + 1 MODEL_BLOB_URI
-	if len(mutations.EnvVars) != 5 {
-		t.Fatalf("expected 5 env vars, got %d", len(mutations.EnvVars))
-	}
-
-	// Find and verify MODEL_BLOB_URI
-	var found bool
+	// Verify account name extracted from endpoint.
+	var accountNameFound bool
+	var modelPathFound bool
 	for _, env := range mutations.EnvVars {
-		if env.Name == "MODEL_BLOB_URI" {
-			found = true
-			expected := "https://myaccount.blob.core.windows.net/models/kaito-models/microsoft/phi-4/abc123"
+		switch env.Name {
+		case "SI_azBlobStorageAccountName":
+			accountNameFound = true
+			if env.Value != "myaccount" {
+				t.Errorf("SI_azBlobStorageAccountName: expected %q, got %q", "myaccount", env.Value)
+			}
+		case "SI_azBlobContainerName":
+			if env.Value != "models" {
+				t.Errorf("SI_azBlobContainerName: expected %q, got %q", "models", env.Value)
+			}
+		case "KAITO_MODEL_PATH":
+			modelPathFound = true
+			expected := "/mnt/models/kaito-models/microsoft/phi-4/abc123"
 			if env.Value != expected {
-				t.Errorf("MODEL_BLOB_URI: expected %q, got %q", expected, env.Value)
+				t.Errorf("KAITO_MODEL_PATH: expected %q, got %q", expected, env.Value)
 			}
 		}
 	}
-	if !found {
-		t.Error("MODEL_BLOB_URI env var not found")
+	if !accountNameFound {
+		t.Error("SI_azBlobStorageAccountName env var not found")
+	}
+	if !modelPathFound {
+		t.Error("KAITO_MODEL_PATH env var not found")
+	}
+
+	// Verify init container and volumes.
+	if len(mutations.InitContainers) != 1 {
+		t.Fatalf("expected 1 init container, got %d", len(mutations.InitContainers))
+	}
+	if len(mutations.Volumes) != 1 {
+		t.Fatalf("expected 1 volume, got %d", len(mutations.Volumes))
+	}
+	if len(mutations.VolumeMounts) != 1 {
+		t.Fatalf("expected 1 volume mount, got %d", len(mutations.VolumeMounts))
 	}
 }
 
@@ -207,9 +259,26 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 4 model weights + 1 KV
-	if len(mutations.EnvVars) != 5 {
-		t.Fatalf("expected 5 env vars, got %d", len(mutations.EnvVars))
+	// 9 SI env vars + 1 KAITO_MODEL_PATH + 1 KV = 11
+	if len(mutations.EnvVars) != 11 {
+		t.Fatalf("expected 11 env vars, got %d", len(mutations.EnvVars))
+	}
+
+	// Verify both SI and KV vars are present.
+	var hasLDPreload, hasKVConfig bool
+	for _, env := range mutations.EnvVars {
+		if env.Name == "LD_PRELOAD" {
+			hasLDPreload = true
+		}
+		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
+			hasKVConfig = true
+		}
+	}
+	if !hasLDPreload {
+		t.Error("LD_PRELOAD not found in combined mutations")
+	}
+	if !hasKVConfig {
+		t.Error("VLLM_KV_TRANSFER_CONFIG not found in combined mutations")
 	}
 }
 

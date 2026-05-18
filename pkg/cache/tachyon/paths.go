@@ -81,3 +81,21 @@ func ModelBlobRelativePath(prefix, modelID, revision string) string {
 
 	return fmt.Sprintf("%s/%s/%s", prefix, encodedModel, url.PathEscape(revision))
 }
+
+const (
+	// DefaultStoragePath is the base path where StorageIntercept intercepts reads.
+	// vLLM's --model path will be a subdirectory of this.
+	DefaultStoragePath = "/mnt/models"
+)
+
+// ModelLocalPath returns the local filesystem path for a model when using
+// StorageIntercept. vLLM's --model flag should point to this path.
+// StorageIntercept maps reads from <storagePath>/<relativeBlobPath>/file
+// to <blobContainer>/<relativeBlobPath>/file in blob storage.
+func ModelLocalPath(storagePath, prefix, modelID, revision string) string {
+	if storagePath == "" {
+		storagePath = DefaultStoragePath
+	}
+	relativePath := ModelBlobRelativePath(prefix, modelID, revision)
+	return fmt.Sprintf("%s/%s", strings.TrimRight(storagePath, "/"), relativePath)
+}
