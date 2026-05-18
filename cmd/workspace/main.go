@@ -58,6 +58,10 @@ import (
 	"github.com/kaito-project/kaito/pkg/version"
 	"github.com/kaito-project/kaito/pkg/workspace/controllers"
 	"github.com/kaito-project/kaito/pkg/workspace/webhooks"
+
+	// Register cache providers (self-register via init()).
+	_ "github.com/kaito-project/kaito/pkg/cache/noop"
+	_ "github.com/kaito-project/kaito/pkg/cache/tachyon"
 )
 
 const (
