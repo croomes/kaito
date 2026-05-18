@@ -50,6 +50,7 @@ import (
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	"github.com/kaito-project/kaito/api/v1beta1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/cache"
 	"github.com/kaito-project/kaito/pkg/featuregates"
 	pkgmodel "github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/nodeprovision"
@@ -325,6 +326,17 @@ func (c *WorkspaceReconciler) addOrUpdateWorkspace(ctx context.Context, wObj *ka
 		if result, err := c.waitForModelMirror(ctx, wObj); err != nil || result != nil {
 			return *result, err
 		}
+	}
+
+	// Check cache readiness when configured. In Required mode, block deployment
+	// until the cache is ready.
+	cacheResult := cache.ReconcileCache(ctx, wObj, &wObj.Status)
+	if cacheResult.BlockDeployment {
+		klog.V(2).InfoS("Cache not ready, blocking deployment", "workspace", klog.KObj(wObj))
+		if cacheResult.RequeueNeeded {
+			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return reconcile.Result{}, nil
 	}
 
 	if wObj.Tuning != nil {
