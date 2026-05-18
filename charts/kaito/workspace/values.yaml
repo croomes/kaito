@@ -190,5 +190,9 @@ cache:
       blobContainer: "kaito-models"
       # Path prefix within the blob container.
       blobPrefix: "kaito-models"
+      # Container image containing libStorageIntercept.so (init container copies it to inference pod).
+      storageInterceptImage: "tachyontestacr.azurecr.io/cache-client-base:latest"
+      # Path to libStorageIntercept.so within the storageInterceptImage.
+      storageInterceptLibPath: "/lib/libStorageIntercept.so"
       # Container image used for prewarm Jobs (downloads from HF, uploads to cache).
       prewarmImage: ""

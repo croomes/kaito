@@ -115,3 +115,54 @@ func TestModelBlobRelativePath(t *testing.T) {
 		})
 	}
 }
+
+func TestModelLocalPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		storagePath string
+		prefix      string
+		modelID     string
+		revision    string
+		expected    string
+	}{
+		{
+			name:        "default storage path",
+			storagePath: "",
+			prefix:      "",
+			modelID:     "microsoft/phi-4",
+			revision:    "main",
+			expected:    "/mnt/models/kaito-models/microsoft/phi-4/main",
+		},
+		{
+			name:        "custom storage path",
+			storagePath: "/data/cache",
+			prefix:      "",
+			modelID:     "microsoft/phi-4",
+			revision:    "abc123",
+			expected:    "/data/cache/kaito-models/microsoft/phi-4/abc123",
+		},
+		{
+			name:        "trailing slash on storage path",
+			storagePath: "/mnt/models/",
+			prefix:      "",
+			modelID:     "meta-llama/Llama-3.3-70B-Instruct",
+			revision:    "",
+			expected:    "/mnt/models/kaito-models/meta-llama/Llama-3.3-70B-Instruct/main",
+		},
+		{
+			name:        "custom prefix",
+			storagePath: "",
+			prefix:      "custom",
+			modelID:     "microsoft/phi-4",
+			revision:    "main",
+			expected:    "/mnt/models/custom/microsoft/phi-4/main",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ModelLocalPath(tt.storagePath, tt.prefix, tt.modelID, tt.revision)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
