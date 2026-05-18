@@ -33,6 +33,7 @@ import (
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	"github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/cache"
 	"github.com/kaito-project/kaito/pkg/featuregates"
 	pkgmodel "github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/sku"
@@ -213,6 +214,11 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 	}
 	if v1beta1.ShouldRunBenchmark(workspaceObj) {
 		podOpts = append(podOpts, SetBenchmarkConfig(distributed))
+	}
+
+	// Inject cache provider mutations (env vars, volumes, etc.) when enabled.
+	if workspaceObj.Cache != nil {
+		podOpts = append(podOpts, cache.SetCacheMutations())
 	}
 
 	ssOpts := []generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, appsv1.StatefulSet]{
