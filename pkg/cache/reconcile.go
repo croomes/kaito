@@ -136,21 +136,51 @@ func ReconcilePrewarm(ctx context.Context, ws *kaitov1beta1.Workspace, kubeClien
 		return PrewarmResult{Phase: PrewarmPhaseFailed}
 
 	default:
-		// No Job exists yet — trigger prewarm.
+		// No Job exists yet — create prewarm Job.
 		req := PrewarmRequest{
 			ModelName:         modelName,
 			ModelRevision:     modelRevision,
 			ModelAccessSecret: modelAccessSecret,
 		}
+
+		// Validate provider config first.
 		if err := p.Prewarm(ctx, req); err != nil {
-			klog.ErrorS(err, "Failed to trigger prewarm", "model", modelName, "provider", providerName)
+			klog.ErrorS(err, "Failed to validate prewarm config", "model", modelName, "provider", providerName)
 			setCacheCondition(status, ws.GetGeneration(),
 				kaitov1beta1.WorkspaceConditionTypeModelWeightsCacheReady, false,
-				fmt.Sprintf("prewarm trigger failed: %v", err))
+				fmt.Sprintf("prewarm config invalid: %v", err))
 			return PrewarmResult{Phase: PrewarmPhaseFailed}
 		}
+
+		// Build and create the prewarm Job.
+		builder, ok := p.(PrewarmJobBuilder)
+		if !ok {
+			klog.V(2).InfoS("Provider does not support Job-based prewarm", "provider", providerName)
+			setCacheCondition(status, ws.GetGeneration(),
+				kaitov1beta1.WorkspaceConditionTypeModelWeightsCacheReady, false,
+				"provider does not support prewarm Jobs")
+			return PrewarmResult{Phase: PrewarmPhaseFailed}
+		}
+
+		job := builder.BuildPrewarmJob(req, ws.Namespace)
+		SetPrewarmOwnerReference(job, ws)
+
+		if err := kubeClient.Create(ctx, job); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Race condition: Job was created between our check and create.
+				// Requeue to pick up its status on next reconcile.
+				return PrewarmResult{Phase: PrewarmPhasePending, RequeueNeeded: true}
+			}
+			klog.ErrorS(err, "Failed to create prewarm Job", "model", modelName, "job", job.Name)
+			setCacheCondition(status, ws.GetGeneration(),
+				kaitov1beta1.WorkspaceConditionTypeModelWeightsCacheReady, false,
+				fmt.Sprintf("failed to create prewarm Job: %v", err))
+			return PrewarmResult{Phase: PrewarmPhaseFailed}
+		}
+
+		klog.InfoS("Created prewarm Job", "job", job.Name, "model", modelName, "namespace", ws.Namespace)
 		setCacheCondition(status, ws.GetGeneration(),
-			kaitov1beta1.WorkspaceConditionTypeModelWeightsCacheReady, false, "prewarm started")
+			kaitov1beta1.WorkspaceConditionTypeModelWeightsCacheReady, false, "prewarm Job created")
 		return PrewarmResult{Phase: PrewarmPhasePending, RequeueNeeded: true}
 	}
 }

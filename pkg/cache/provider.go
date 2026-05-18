@@ -16,6 +16,7 @@ package cache
 import (
 	"context"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -92,5 +93,12 @@ type Provider interface {
 
 	// Cleanup invalidates cached data for the specified model.
 	Cleanup(ctx context.Context, req PrewarmRequest) error
+}
+
+// PrewarmJobBuilder is an optional interface that providers can implement
+// to supply a Kubernetes Job spec for prewarming. The reconciler handles
+// Job creation and lifecycle management, keeping providers declarative.
+type PrewarmJobBuilder interface {
+	BuildPrewarmJob(req PrewarmRequest, namespace string) *batchv1.Job
 }
 
