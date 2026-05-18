@@ -43,11 +43,11 @@ func (p *Provider) PodMutations(_ context.Context, _ *kaitov1beta1.Workspace) (*
 	return &cache.PodMutations{}, nil
 }
 
-func (p *Provider) Prewarm(_ context.Context, _ *kaitov1beta1.Workspace) error {
+func (p *Provider) Prewarm(_ context.Context, _ cache.PrewarmRequest) error {
 	return nil
 }
 
-func (p *Provider) Cleanup(_ context.Context, _ *kaitov1beta1.Workspace) error {
+func (p *Provider) Cleanup(_ context.Context, _ cache.PrewarmRequest) error {
 	return nil
 }
 
