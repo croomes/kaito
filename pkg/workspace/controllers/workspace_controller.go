@@ -585,6 +585,26 @@ func (c *WorkspaceReconciler) applyInference(ctx context.Context, wObj *kaitov1b
 		return err
 	}
 
+	// Trigger/track model weight prewarm after model resolution.
+	if wObj.Cache != nil && wObj.Cache.ModelWeights != nil && wObj.Cache.ModelWeights.PrewarmOnDeploy {
+		params := model.GetInferenceParameters()
+		var modelName, modelRevision string
+		if params != nil {
+			modelName = params.Name
+			if params.Version != "" {
+				_, rev, _ := utils.ParseHuggingFaceModelVersion(params.Version)
+				modelRevision = rev
+			}
+		}
+		if modelName == "" {
+			modelName = presetName
+		}
+		cache.ReconcilePrewarm(ctx, wObj, c.Client,
+			modelName, modelRevision,
+			wObj.Inference.Preset.PresetOptions.ModelAccessSecret,
+			&wObj.Status)
+	}
+
 	revisionStr := wObj.Annotations[kaitov1beta1.WorkspaceRevisionAnnotation]
 	workloadObj, err := inference.GeneratePresetInference(ctx, wObj, revisionStr, model, c.Client)
 	if err != nil {

@@ -195,3 +195,12 @@ cache:
       modelWeightsEnabled: true
       kvCacheEnabled: true
       kvConnectorProtocol: "tcp"
+      # Azure Blob Storage endpoint for model weight caching.
+      # Required when modelWeightsEnabled is true.
+      blobEndpoint: ""
+      # Blob container for model weight storage.
+      blobContainer: "kaito-models"
+      # Path prefix within the blob container.
+      blobPrefix: "kaito-models"
+      # Container image used for prewarm Jobs (downloads from HF, uploads to cache).
+      prewarmImage: ""

@@ -22,6 +22,7 @@ import (
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/featuregates"
+	"github.com/kaito-project/kaito/pkg/utils"
 	"github.com/kaito-project/kaito/pkg/utils/consts"
 	"github.com/kaito-project/kaito/pkg/utils/generator"
 )
@@ -40,7 +41,26 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 			return nil
 		}
 
-		mutations, err := collectMutations(ctx.Ctx, ws)
+		// Extract model name and revision from the model's metadata.
+		var modelName, modelRevision string
+		if ctx.Model != nil {
+			params := ctx.Model.GetInferenceParameters()
+			if params != nil {
+				modelName = params.Name
+				if params.Version != "" {
+					_, revision, err := utils.ParseHuggingFaceModelVersion(params.Version)
+					if err == nil {
+						modelRevision = revision
+					}
+				}
+				// If model name from params is empty, try preset name.
+				if modelName == "" && ws.Inference != nil && ws.Inference.Preset != nil {
+					modelName = string(ws.Inference.Preset.Name)
+				}
+			}
+		}
+
+		mutations, err := collectMutations(ctx.Ctx, ws, modelName, modelRevision)
 		if err != nil {
 			return fmt.Errorf("collecting cache mutations: %w", err)
 		}
@@ -51,7 +71,7 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 }
 
 // collectMutations gathers PodMutations from all configured cache providers.
-func collectMutations(ctx context.Context, ws *kaitov1beta1.Workspace) (*PodMutations, error) {
+func collectMutations(ctx context.Context, ws *kaitov1beta1.Workspace, modelName, modelRevision string) (*PodMutations, error) {
 	merged := &PodMutations{}
 
 	// Model weights provider
@@ -64,7 +84,7 @@ func collectMutations(ctx context.Context, ws *kaitov1beta1.Workspace) (*PodMuta
 			klog.V(2).InfoS("Model weights cache provider not available, skipping",
 				"provider", ws.Cache.ModelWeights.Provider, "error", err)
 		} else {
-			m, err := p.PodMutations(ctx, ws)
+			m, err := p.PodMutations(ctx, ws, modelName, modelRevision)
 			if err != nil {
 				if ws.Cache.ModelWeights.Mode == kaitov1beta1.CacheModeRequired {
 					return nil, fmt.Errorf("model weights cache mutations: %w", err)
@@ -87,7 +107,7 @@ func collectMutations(ctx context.Context, ws *kaitov1beta1.Workspace) (*PodMuta
 			klog.V(2).InfoS("KV cache provider not available, skipping",
 				"provider", ws.Cache.KVCache.Provider, "error", err)
 		} else {
-			m, err := p.PodMutations(ctx, ws)
+			m, err := p.PodMutations(ctx, ws, modelName, modelRevision)
 			if err != nil {
 				if ws.Cache.KVCache.Mode == kaitov1beta1.CacheModeRequired {
 					return nil, fmt.Errorf("KV cache mutations: %w", err)
