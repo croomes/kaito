@@ -144,5 +144,5 @@ func (p *noopTestProvider) IsReady(_ context.Context) (bool, string, error) {
 func (p *noopTestProvider) PodMutations(_ context.Context, _ *kaitov1beta1.Workspace) (*PodMutations, error) {
 	return &PodMutations{}, nil
 }
-func (p *noopTestProvider) Prewarm(_ context.Context, _ *kaitov1beta1.Workspace) error  { return nil }
-func (p *noopTestProvider) Cleanup(_ context.Context, _ *kaitov1beta1.Workspace) error { return nil }
+func (p *noopTestProvider) Prewarm(_ context.Context, _ PrewarmRequest) error  { return nil }
+func (p *noopTestProvider) Cleanup(_ context.Context, _ PrewarmRequest) error { return nil }

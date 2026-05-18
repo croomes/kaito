@@ -35,6 +35,19 @@ type PodMutations struct {
 	InitContainers []corev1.Container
 }
 
+// PrewarmRequest describes a model to be prewarmed into the cache.
+// Decoupled from Workspace so it can be triggered by either a Workspace
+// controller (on deploy) or a future Model CR controller (on creation).
+type PrewarmRequest struct {
+	// ModelName is the model identifier (e.g., "microsoft/phi-4").
+	ModelName string
+	// ModelSource is the registry or repository path for model weights.
+	ModelSource string
+	// ModelFiles optionally lists specific weight files to prewarm.
+	// If empty, the provider should prewarm all files for the model.
+	ModelFiles []string
+}
+
 // Provider defines the interface that cache implementations must satisfy.
 // Each provider handles the specifics of its cache backend while KAITO's
 // workspace controller interacts through this common contract.
@@ -54,10 +67,12 @@ type Provider interface {
 	// access for a given workspace (env vars, volumes, mounts, init containers).
 	PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace) (*PodMutations, error)
 
-	// Prewarm triggers cache population for the model associated with
-	// the given workspace. Returns immediately; warming is asynchronous.
-	Prewarm(ctx context.Context, workspace *kaitov1beta1.Workspace) error
+	// Prewarm triggers cache population for the specified model.
+	// Can be called by the workspace controller (on deploy with prewarmOnDeploy)
+	// or by a future Model CR controller (on model registration).
+	// Returns immediately; warming is asynchronous.
+	Prewarm(ctx context.Context, req PrewarmRequest) error
 
-	// Cleanup invalidates cached data associated with a workspace.
-	Cleanup(ctx context.Context, workspace *kaitov1beta1.Workspace) error
+	// Cleanup invalidates cached data for the specified model.
+	Cleanup(ctx context.Context, req PrewarmRequest) error
 }

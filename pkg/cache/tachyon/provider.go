@@ -150,14 +150,14 @@ func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Wor
 }
 
 // Prewarm is a placeholder for cache population logic.
-func (p *Provider) Prewarm(ctx context.Context, workspace *kaitov1beta1.Workspace) error {
-	klog.V(4).InfoS("Prewarm requested (not yet implemented)", "workspace", workspace.Name)
+func (p *Provider) Prewarm(ctx context.Context, req cache.PrewarmRequest) error {
+	klog.V(4).InfoS("Prewarm requested (not yet implemented)", "model", req.ModelName, "source", req.ModelSource)
 	return nil
 }
 
 // Cleanup is a placeholder for cache invalidation logic.
-func (p *Provider) Cleanup(ctx context.Context, workspace *kaitov1beta1.Workspace) error {
-	klog.V(4).InfoS("Cleanup requested (not yet implemented)", "workspace", workspace.Name)
+func (p *Provider) Cleanup(ctx context.Context, req cache.PrewarmRequest) error {
+	klog.V(4).InfoS("Cleanup requested (not yet implemented)", "model", req.ModelName, "source", req.ModelSource)
 	return nil
 }
 
