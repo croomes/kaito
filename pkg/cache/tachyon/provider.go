@@ -150,11 +150,11 @@ func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Wor
 	if workspace.Cache.ModelWeights != nil && workspace.Cache.ModelWeights.Mode != kaitov1beta1.CacheModeDisabled && p.config.ModelWeightsEnabled {
 		mutations.EnvVars = append(mutations.EnvVars, modelWeightsEnvVars(p.config.DiscoveryEndpoint)...)
 
-		// Inject the blob model path so RunAI streamer reads from blob via cache.
+		// Inject the blob model path so vLLM loads from blob storage via cache.
 		if p.config.BlobEndpoint != "" && modelName != "" {
 			blobPath := ModelBlobPath(p.config.BlobEndpoint, p.config.BlobContainer, p.config.BlobPrefix, modelName, modelRevision)
 			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
-				Name:  "RUNAI_MODEL_URI",
+				Name:  "MODEL_BLOB_URI",
 				Value: blobPath,
 			})
 		}

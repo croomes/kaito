@@ -82,7 +82,7 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 4 StorageIntercept env vars (no RUNAI_MODEL_URI since BlobEndpoint is empty in default config)
+	// 4 StorageIntercept env vars (no MODEL_BLOB_URI since BlobEndpoint is empty in default config)
 	if len(mutations.EnvVars) != 4 {
 		t.Fatalf("expected 4 env vars for model weights, got %d", len(mutations.EnvVars))
 	}
@@ -130,24 +130,24 @@ func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 4 StorageIntercept env vars + 1 RUNAI_MODEL_URI
+	// 4 StorageIntercept env vars + 1 MODEL_BLOB_URI
 	if len(mutations.EnvVars) != 5 {
 		t.Fatalf("expected 5 env vars, got %d", len(mutations.EnvVars))
 	}
 
-	// Find and verify RUNAI_MODEL_URI
+	// Find and verify MODEL_BLOB_URI
 	var found bool
 	for _, env := range mutations.EnvVars {
-		if env.Name == "RUNAI_MODEL_URI" {
+		if env.Name == "MODEL_BLOB_URI" {
 			found = true
 			expected := "https://myaccount.blob.core.windows.net/models/kaito-models/microsoft/phi-4/abc123"
 			if env.Value != expected {
-				t.Errorf("RUNAI_MODEL_URI: expected %q, got %q", expected, env.Value)
+				t.Errorf("MODEL_BLOB_URI: expected %q, got %q", expected, env.Value)
 			}
 		}
 	}
 	if !found {
-		t.Error("RUNAI_MODEL_URI env var not found")
+		t.Error("MODEL_BLOB_URI env var not found")
 	}
 }
 
