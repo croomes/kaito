@@ -49,6 +49,8 @@ const (
 
 	FeatureFlagEnableMultiRoleInferenceController = "enableMultiRoleInferenceController"
 
+	FeatureFlagDistributedCache = "distributedCache"
+
 	// Node provisioner types
 	NodeProvisionerAzureGPU  = "azure-gpu-provisioner"
 	NodeProvisionerKarpenter = "karpenter"

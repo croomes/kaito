@@ -42,6 +42,7 @@ featureGates:
   gatewayAPIInferenceExtension: false
   enableInferenceSetController: false
   enableMultiRoleInferenceController: false
+  distributedCache: false
 defaultNodeImageFamily: ""
 nodeProvisioner: ""
 karpenterProvider: "azure"
@@ -171,3 +172,14 @@ local-csi-driver:
   observability:
     metrics:
       enabled: false
+
+# Distributed cache provider configuration.
+# Only active when featureGates.distributedCache is true.
+cache:
+  providers:
+    tachyon:
+      enabled: false
+      discoveryEndpoint: "http://cacheserver-discovery.tachyon-cache-system.svc.cluster.local:9065"
+      modelWeightsEnabled: true
+      kvCacheEnabled: true
+      kvConnectorProtocol: "tcp"
