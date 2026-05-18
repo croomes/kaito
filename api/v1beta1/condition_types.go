@@ -58,4 +58,10 @@ const (
 	// True means the benchmark completed and results are stored in status.benchmarkResult.
 	// Set by default; omitted when kaito.sh/disable-benchmark is "true".
 	WorkspaceConditionTypeBenchmarkCompleted = ConditionType("BenchmarkCompleted")
+
+	// WorkspaceConditionTypeModelWeightsCacheReady indicates whether the model weights cache is ready.
+	WorkspaceConditionTypeModelWeightsCacheReady = ConditionType("ModelWeightsCacheReady")
+
+	// WorkspaceConditionTypeKVCacheReady indicates whether the KV cache is ready.
+	WorkspaceConditionTypeKVCacheReady = ConditionType("KVCacheReady")
 )
