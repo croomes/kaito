@@ -25,42 +25,13 @@ const (
 
 	// DefaultRevision is used when no revision is specified.
 	DefaultRevision = "main"
+
+	// DefaultStoragePath is the base path where StorageIntercept intercepts reads.
+	// vLLM's --model path will be a subdirectory of this.
+	DefaultStoragePath = "/mnt/models"
 )
 
-// ModelBlobPath derives the deterministic blob path for a model.
-// The convention is:
-//
-//	<blobEndpoint>/<container>/<prefix>/<org>/<model>/<revision>/
-//
-// Both the prewarm Job (upload target) and PodMutations (runtime read source)
-// use this function to ensure consistency.
-func ModelBlobPath(blobEndpoint, container, prefix, modelID, revision string) string {
-	if prefix == "" {
-		prefix = DefaultBlobPrefix
-	}
-	if revision == "" {
-		revision = DefaultRevision
-	}
-
-	// URL-escape path segments to handle any special characters.
-	parts := strings.SplitN(modelID, "/", 2)
-	var encodedModel string
-	if len(parts) == 2 {
-		encodedModel = url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1])
-	} else {
-		encodedModel = url.PathEscape(modelID)
-	}
-
-	return fmt.Sprintf("%s/%s/%s/%s/%s",
-		strings.TrimRight(blobEndpoint, "/"),
-		url.PathEscape(container),
-		prefix,
-		encodedModel,
-		url.PathEscape(revision),
-	)
-}
-
-// ModelBlobRelativePath returns just the relative path within the container,
+// ModelBlobRelativePath returns the relative path within the container,
 // without the endpoint prefix. Used for prewarm uploads where the endpoint
 // is configured separately.
 func ModelBlobRelativePath(prefix, modelID, revision string) string {
@@ -81,12 +52,6 @@ func ModelBlobRelativePath(prefix, modelID, revision string) string {
 
 	return fmt.Sprintf("%s/%s/%s", prefix, encodedModel, url.PathEscape(revision))
 }
-
-const (
-	// DefaultStoragePath is the base path where StorageIntercept intercepts reads.
-	// vLLM's --model path will be a subdirectory of this.
-	DefaultStoragePath = "/mnt/models"
-)
 
 // ModelLocalPath returns the local filesystem path for a model when using
 // StorageIntercept. vLLM's --model flag should point to this path.

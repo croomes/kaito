@@ -98,6 +98,7 @@ func (p *Provider) BuildPrewarmJob(req cache.PrewarmRequest, namespace string) *
 					Labels: map[string]string{
 						PrewarmJobLabelKey: PrewarmJobLabelValue,
 						PrewarmModelLabel:  modelLabel,
+						InjectLabelKey:     InjectLabelValue,
 					},
 				},
 				Spec: corev1.PodSpec{
