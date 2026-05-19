@@ -43,6 +43,7 @@ featureGates:
   enableInferenceSetController: false
   enableMultiRoleInferenceController: false
   distributedCache: false
+  distributedCache: false
 defaultNodeImageFamily: ""
 nodeProvisioner: ""
 karpenterProvider: "azure"

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -349,6 +350,41 @@ func checkCacheReady(obj *unstructured.Unstructured) (bool, string) {
 	return false, "Ready condition not found"
 }
 
-func init() {
-	cache.Register(&Provider{config: DefaultConfig()})
+// ConfigFromEnv builds a Config from environment variables (set via Helm chart).
+// Falls back to DefaultConfig() for any unset values.
+func ConfigFromEnv() Config {
+	cfg := DefaultConfig()
+
+	if v := os.Getenv("TACHYON_DISCOVERY_ENDPOINT"); v != "" {
+		cfg.DiscoveryEndpoint = v
+	}
+	if v := os.Getenv("TACHYON_MODEL_WEIGHTS_ENABLED"); v != "" {
+		cfg.ModelWeightsEnabled = v == "true"
+	}
+	if v := os.Getenv("TACHYON_KV_CACHE_ENABLED"); v != "" {
+		cfg.KVCacheEnabled = v == "true"
+	}
+	if v := os.Getenv("TACHYON_KV_CONNECTOR_PROTOCOL"); v != "" {
+		cfg.KVConnectorProtocol = v
+	}
+	if v := os.Getenv("TACHYON_BLOB_ENDPOINT"); v != "" {
+		cfg.BlobEndpoint = v
+	}
+	if v := os.Getenv("TACHYON_BLOB_CONTAINER"); v != "" {
+		cfg.BlobContainer = v
+	}
+	if v := os.Getenv("TACHYON_BLOB_PREFIX"); v != "" {
+		cfg.BlobPrefix = v
+	}
+	if v := os.Getenv("TACHYON_STORAGE_INTERCEPT_IMAGE"); v != "" {
+		cfg.StorageInterceptImage = v
+	}
+	if v := os.Getenv("TACHYON_STORAGE_INTERCEPT_LIB_PATH"); v != "" {
+		cfg.StorageInterceptLibPath = v
+	}
+	if v := os.Getenv("TACHYON_PREWARM_IMAGE"); v != "" {
+		cfg.PrewarmImage = v
+	}
+
+	return cfg
 }

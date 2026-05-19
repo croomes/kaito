@@ -30,6 +30,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -47,6 +48,9 @@ import (
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/cache"
+	cachenoop "github.com/kaito-project/kaito/pkg/cache/noop"
+	"github.com/kaito-project/kaito/pkg/cache/tachyon"
 	drift "github.com/kaito-project/kaito/pkg/controllers/drift"
 	multiroleinference "github.com/kaito-project/kaito/pkg/controllers/multiroleinference"
 	"github.com/kaito-project/kaito/pkg/featuregates"
@@ -58,10 +62,6 @@ import (
 	"github.com/kaito-project/kaito/pkg/version"
 	"github.com/kaito-project/kaito/pkg/workspace/controllers"
 	"github.com/kaito-project/kaito/pkg/workspace/webhooks"
-
-	// Register cache providers (self-register via init()).
-	_ "github.com/kaito-project/kaito/pkg/cache/noop"
-	_ "github.com/kaito-project/kaito/pkg/cache/tachyon"
 )
 
 const (
@@ -190,6 +190,20 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	cfg.UserAgent = workspaceController
 	setRestConfig(cfg, kubeClientQPS, kubeClientBurst)
+
+	// Register cache providers based on feature gates and configuration.
+	cache.Register(cachenoop.NewProvider())
+	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] {
+		dynamicClient, dynErr := dynamic.NewForConfig(cfg)
+		if dynErr != nil {
+			klog.ErrorS(dynErr, "unable to create dynamic client for cache providers")
+			exitWithErrorFunc()
+		}
+		tachyonCfg := tachyon.ConfigFromEnv()
+		cache.Register(tachyon.New(dynamicClient, tachyonCfg))
+		klog.InfoS("Registered Tachyon cache provider", "discoveryEndpoint", tachyonCfg.DiscoveryEndpoint,
+			"modelWeightsEnabled", tachyonCfg.ModelWeightsEnabled, "kvCacheEnabled", tachyonCfg.KVCacheEnabled)
+	}
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,

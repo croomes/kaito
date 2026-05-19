@@ -51,6 +51,7 @@ func (p *Provider) Cleanup(_ context.Context, _ cache.PrewarmRequest) error {
 	return nil
 }
 
-func init() {
-	cache.Register(&Provider{})
+// NewProvider returns a new noop cache provider instance.
+func NewProvider() *Provider {
+	return &Provider{}
 }

@@ -457,10 +457,11 @@ func TestIsReady_WithReadyCache(t *testing.T) {
 	}
 }
 
-// Ensure the init-registered provider uses the correct name.
-func TestInitRegistration(t *testing.T) {
-	// The init() in provider.go registers a Provider.
-	// Verify via the registry.
+// Ensure explicit registration works correctly.
+func TestExplicitRegistration(t *testing.T) {
+	p := newFakeProvider()
+	cache.Register(p)
+
 	got, err := cache.Get(kaitov1beta1.CacheProvider(ProviderName))
 	if err != nil {
 		t.Fatalf("tachyon provider not registered: %v", err)
