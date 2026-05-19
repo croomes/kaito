@@ -76,8 +76,6 @@ spec:
             {{- if and .Values.featureGates.distributedCache .Values.cache.providers.tachyon.enabled }}
             - name: TACHYON_DISCOVERY_ENDPOINT
               value: {{ .Values.cache.providers.tachyon.discoveryEndpoint | quote }}
-            - name: TACHYON_MODEL_WEIGHTS_ENABLED
-              value: {{ .Values.cache.providers.tachyon.modelWeightsEnabled | quote }}
             - name: TACHYON_KV_CACHE_ENABLED
               value: {{ .Values.cache.providers.tachyon.kvCacheEnabled | quote }}
             - name: TACHYON_KV_CONNECTOR_PROTOCOL
@@ -88,10 +86,6 @@ spec:
               value: {{ .Values.cache.providers.tachyon.blobContainer | quote }}
             - name: TACHYON_BLOB_PREFIX
               value: {{ .Values.cache.providers.tachyon.blobPrefix | quote }}
-            - name: TACHYON_STORAGE_INTERCEPT_IMAGE
-              value: {{ .Values.cache.providers.tachyon.storageInterceptImage | quote }}
-            - name: TACHYON_STORAGE_INTERCEPT_LIB_PATH
-              value: {{ .Values.cache.providers.tachyon.storageInterceptLibPath | quote }}
             - name: TACHYON_PREWARM_IMAGE
               value: {{ .Values.cache.providers.tachyon.prewarmImage | quote }}
             {{- end }}

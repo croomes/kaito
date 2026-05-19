@@ -212,7 +212,7 @@ func main() {
 		tachyonCfg := tachyon.ConfigFromEnv()
 		cache.Register(tachyon.New(dynamicClient, tachyonCfg))
 		klog.InfoS("Registered Tachyon cache provider", "discoveryEndpoint", tachyonCfg.DiscoveryEndpoint,
-			"modelWeightsEnabled", tachyonCfg.ModelWeightsEnabled, "kvCacheEnabled", tachyonCfg.KVCacheEnabled)
+			"kvCacheEnabled", tachyonCfg.KVCacheEnabled)
 	}
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{

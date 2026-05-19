@@ -14,461 +14,433 @@
 package tachyon
 
 import (
-	"context"
-	"encoding/json"
-	"testing"
+"context"
+"encoding/json"
+"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
+metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+"k8s.io/apimachinery/pkg/runtime"
+"k8s.io/apimachinery/pkg/runtime/schema"
+dynamicfake "k8s.io/client-go/dynamic/fake"
 
-	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
-	"github.com/kaito-project/kaito/pkg/cache"
+kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+"github.com/kaito-project/kaito/pkg/cache"
 )
 
 func newFakeProvider(objects ...runtime.Object) *Provider {
-	scheme := runtime.NewScheme()
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{
-			cacheGVR: "CacheList",
-		}, objects...)
-	return New(client, DefaultConfig())
+scheme := runtime.NewScheme()
+client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+map[schema.GroupVersionResource]string{
+cacheGVR: "CacheList",
+}, objects...)
+return New(client, DefaultConfig())
 }
 
 func newReadyCache() *unstructured.Unstructured {
-	return &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "storage.azure.com/v1",
-			"kind":       "Cache",
-			"metadata": map[string]interface{}{
-				"name":      "test-cache",
-				"namespace": CacheNamespace,
-			},
-			"status": map[string]interface{}{
-				"conditions": []interface{}{
-					map[string]interface{}{
-						"type":   "Ready",
-						"status": "True",
-						"reason": "CacheReady",
-					},
-				},
-			},
-		},
-	}
+return &unstructured.Unstructured{
+Object: map[string]interface{}{
+"apiVersion": "storage.azure.com/v1",
+"kind":       "Cache",
+"metadata": map[string]interface{}{
+"name":      "test-cache",
+"namespace": CacheNamespace,
+},
+"status": map[string]interface{}{
+"conditions": []interface{}{
+map[string]interface{}{
+"type":   "Ready",
+"status": "True",
+"reason": "CacheReady",
+},
+},
+},
+},
+}
 }
 
 func TestProviderName(t *testing.T) {
-	p := newFakeProvider()
-	if p.Name() != ProviderName {
-		t.Errorf("expected %q, got %q", ProviderName, p.Name())
-	}
+p := newFakeProvider()
+if p.Name() != ProviderName {
+t.Errorf("expected %q, got %q", ProviderName, p.Name())
+}
 }
 
-func TestPodMutations_ModelWeightsOnly(t *testing.T) {
-	p := newFakeProvider()
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeOpportunistic,
-			},
-		},
-	}
-
-	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Init container for SI library injection.
-	if len(mutations.InitContainers) != 1 {
-	}
-	if mutations.InitContainers[0].Name != "tachyon-lib-loader" {
-		t.Errorf("init container name: got %q, want %q", mutations.InitContainers[0].Name, "tachyon-lib-loader")
-	}
-	if mutations.InitContainers[0].Image != DefaultStorageInterceptImage {
-		t.Errorf("init container image: got %q, want %q", mutations.InitContainers[0].Image, DefaultStorageInterceptImage)
-	}
-
-	// Shared volume for SI library.
-	if len(mutations.Volumes) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(mutations.Volumes))
-	}
-	if mutations.Volumes[0].Name != "tachyon-lib" {
-		t.Errorf("volume name: got %q, want %q", mutations.Volumes[0].Name, "tachyon-lib")
-	}
-
-	// Volume mount for SI library.
-	if len(mutations.VolumeMounts) != 1 {
-		t.Fatalf("expected 1 volume mount, got %d", len(mutations.VolumeMounts))
-	}
-	if mutations.VolumeMounts[0].MountPath != "/opt/tachyon" {
-		t.Errorf("volume mount path: got %q, want %q", mutations.VolumeMounts[0].MountPath, "/opt/tachyon")
-	}
-
-	// Env vars: 9 SI config + 1 KAITO_MODEL_PATH = 10 (BlobEndpoint is empty, but account name will be empty string)
-	expectedEnvs := map[string]string{
-		"LD_PRELOAD":                       "/opt/tachyon/libStorageIntercept.so",
-		"SI_storagePath":                   "/mnt/models",
-		"SI_type":                          "blob",
-		"SI_azBlobStorageAccName":      "",
-		"SI_azBlobStorageEndpointUrl":         "",
-		"SI_azBlobContainerName":           "kaito-models",
-		"SI_cacheEnable":                   "true",
-		"SI_cacheServerDiscoveryEnabled":   "true",
-		"SI_cacheServerDiscoveryEndpoint":  DefaultDiscoveryEndpoint,
-		"KAITO_MODEL_PATH":                "/mnt/models/kaito-models/microsoft/phi-4/main",
-	}
-	if len(mutations.EnvVars) != len(expectedEnvs) {
-		t.Fatalf("expected %d env vars, got %d: %v", len(expectedEnvs), len(mutations.EnvVars), mutations.EnvVars)
-	}
-	for _, env := range mutations.EnvVars {
-		expected, ok := expectedEnvs[env.Name]
-		if !ok {
-			t.Errorf("unexpected env var: %s", env.Name)
-			continue
-		}
-		if env.Value != expected {
-			t.Errorf("env %s: expected %q, got %q", env.Name, expected, env.Value)
-		}
-	}
+func TestPodMutations_ModelWeights(t *testing.T) {
+p := newFakeProvider()
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeOpportunistic,
+},
+},
 }
 
-func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
-	scheme := runtime.NewScheme()
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{
-			cacheGVR: "CacheList",
-		})
-	cfg := DefaultConfig()
-	cfg.BlobEndpoint = "https://myaccount.blob.core.windows.net"
-	cfg.BlobContainer = "models"
-	p := New(client, cfg)
+mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
 
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeOpportunistic,
-			},
-		},
-	}
+// Should have the injection label.
+if mutations.Labels == nil {
+t.Fatal("expected labels, got nil")
+}
+if mutations.Labels[InjectLabelKey] != InjectLabelValue {
+t.Errorf("label %s: got %q, want %q", InjectLabelKey, mutations.Labels[InjectLabelKey], InjectLabelValue)
+}
 
-	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "abc123")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+// Should have KAITO_MODEL_PATH env var only.
+if len(mutations.EnvVars) != 1 {
+t.Fatalf("expected 1 env var (KAITO_MODEL_PATH), got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
+}
+if mutations.EnvVars[0].Name != "KAITO_MODEL_PATH" {
+t.Errorf("env var name: got %q, want %q", mutations.EnvVars[0].Name, "KAITO_MODEL_PATH")
+}
+expectedPath := "/mnt/models/kaito-models/microsoft/phi-4/main"
+if mutations.EnvVars[0].Value != expectedPath {
+t.Errorf("KAITO_MODEL_PATH: got %q, want %q", mutations.EnvVars[0].Value, expectedPath)
+}
 
-	// Verify account name extracted from endpoint.
-	var accountNameFound bool
-	var modelPathFound bool
-	for _, env := range mutations.EnvVars {
-		switch env.Name {
-		case "SI_azBlobStorageAccName":
-			accountNameFound = true
-			if env.Value != "myaccount" {
-				t.Errorf("SI_azBlobStorageAccName: expected %q, got %q", "myaccount", env.Value)
-			}
-		case "SI_azBlobContainerName":
-			if env.Value != "models" {
-				t.Errorf("SI_azBlobContainerName: expected %q, got %q", "models", env.Value)
-			}
-		case "KAITO_MODEL_PATH":
-			modelPathFound = true
-			expected := "/mnt/models/kaito-models/microsoft/phi-4/abc123"
-			if env.Value != expected {
-				t.Errorf("KAITO_MODEL_PATH: expected %q, got %q", expected, env.Value)
-			}
-		}
-	}
-	if !accountNameFound {
-		t.Error("SI_azBlobStorageAccName env var not found")
-	}
-	if !modelPathFound {
-		t.Error("KAITO_MODEL_PATH env var not found")
-	}
+// Should NOT have init containers, volumes, or volume mounts (webhook handles these).
+if len(mutations.InitContainers) != 0 {
+t.Errorf("expected 0 init containers (webhook handles injection), got %d", len(mutations.InitContainers))
+}
+if len(mutations.Volumes) != 0 {
+t.Errorf("expected 0 volumes, got %d", len(mutations.Volumes))
+}
+if len(mutations.VolumeMounts) != 0 {
+t.Errorf("expected 0 volume mounts, got %d", len(mutations.VolumeMounts))
+}
+}
 
-	// Verify init container and volumes.
-	if len(mutations.InitContainers) != 1 {
-		t.Fatalf("expected 1 init container, got %d", len(mutations.InitContainers))
-	}
-	if len(mutations.Volumes) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(mutations.Volumes))
-	}
-	if len(mutations.VolumeMounts) != 1 {
-		t.Fatalf("expected 1 volume mount, got %d", len(mutations.VolumeMounts))
-	}
+func TestPodMutations_ModelWeightsCustomPrefix(t *testing.T) {
+scheme := runtime.NewScheme()
+client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+map[schema.GroupVersionResource]string{
+cacheGVR: "CacheList",
+})
+cfg := DefaultConfig()
+cfg.BlobPrefix = "custom-prefix"
+p := New(client, cfg)
+
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeOpportunistic,
+},
+},
+}
+
+mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "abc123")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+
+if len(mutations.EnvVars) != 1 {
+t.Fatalf("expected 1 env var, got %d", len(mutations.EnvVars))
+}
+expectedPath := "/mnt/models/custom-prefix/microsoft/phi-4/abc123"
+if mutations.EnvVars[0].Value != expectedPath {
+t.Errorf("KAITO_MODEL_PATH: got %q, want %q", mutations.EnvVars[0].Value, expectedPath)
+}
+}
+
+func TestPodMutations_ModelWeightsNoModelName(t *testing.T) {
+p := newFakeProvider()
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeOpportunistic,
+},
+},
+}
+
+mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "", "")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+
+// Label still set even without model name.
+if mutations.Labels[InjectLabelKey] != InjectLabelValue {
+t.Error("injection label should be set even without model name")
+}
+
+// No KAITO_MODEL_PATH when model name is empty.
+if len(mutations.EnvVars) != 0 {
+t.Errorf("expected 0 env vars when model name empty, got %d", len(mutations.EnvVars))
+}
 }
 
 func TestPodMutations_KVCacheOnly(t *testing.T) {
-	p := newFakeProvider()
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			KVCache: &kaitov1beta1.KVCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeRequired,
-			},
-		},
-	}
+p := newFakeProvider()
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+KVCache: &kaitov1beta1.KVCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeRequired,
+},
+},
+}
 
-	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+mutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
 
-	if len(mutations.EnvVars) != 1 {
-		t.Fatalf("expected 1 env var for KV cache, got %d", len(mutations.EnvVars))
-	}
+// Should have injection label.
+if mutations.Labels == nil || mutations.Labels[InjectLabelKey] != InjectLabelValue {
+t.Error("expected injection label for KV cache concern")
+}
 
-	if mutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
-		t.Errorf("expected VLLM_KV_TRANSFER_CONFIG, got %s", mutations.EnvVars[0].Name)
-	}
+// Should have VLLM_KV_TRANSFER_CONFIG env var.
+if len(mutations.EnvVars) != 1 {
+t.Fatalf("expected 1 env var for KV cache, got %d", len(mutations.EnvVars))
+}
+if mutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
+t.Errorf("expected VLLM_KV_TRANSFER_CONFIG, got %s", mutations.EnvVars[0].Name)
+}
 
-	var cfg kvTransferConfig
-	if err := json.Unmarshal([]byte(mutations.EnvVars[0].Value), &cfg); err != nil {
-		t.Fatalf("failed to parse KV config: %v", err)
-	}
-	if cfg.KVConnector != "TachyonKVConnector" {
-		t.Errorf("expected TachyonKVConnector, got %s", cfg.KVConnector)
-	}
-	if cfg.Protocol != "tcp" {
-		t.Errorf("expected tcp protocol, got %s", cfg.Protocol)
-	}
+// Verify vLLM v1 format with kv_connector_extra_config.
+var cfg kvTransferConfig
+if err := json.Unmarshal([]byte(mutations.EnvVars[0].Value), &cfg); err != nil {
+t.Fatalf("failed to parse KV config: %v", err)
+}
+if cfg.KVConnector != "py_tachyon_client.connectors.vllm_connector.TachyonKVConnector" {
+t.Errorf("kv_connector: got %q, want full Python path", cfg.KVConnector)
+}
+if cfg.KVConnectorExtraConfig == nil {
+t.Fatal("expected kv_connector_extra_config, got nil")
+}
+if cfg.KVConnectorExtraConfig["protocol"] != "tcp" {
+t.Errorf("protocol: got %v, want tcp", cfg.KVConnectorExtraConfig["protocol"])
+}
+if cfg.KVConnectorExtraConfig["locator_nodes"] != DefaultDiscoveryEndpoint {
+t.Errorf("locator_nodes: got %v, want %s", cfg.KVConnectorExtraConfig["locator_nodes"], DefaultDiscoveryEndpoint)
+}
+
+// Should NOT have init containers.
+if len(mutations.InitContainers) != 0 {
+t.Errorf("expected 0 init containers, got %d", len(mutations.InitContainers))
+}
 }
 
 func TestPodMutations_BothConcerns(t *testing.T) {
-	p := newFakeProvider()
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeOpportunistic,
-			},
-			KVCache: &kaitov1beta1.KVCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeOpportunistic,
-			},
-		},
-	}
-
-	// Model weights concern returns SI mutations only (no KV).
-	mwMutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("model weights: unexpected error: %v", err)
-	}
-	// 9 SI env vars + 1 KAITO_MODEL_PATH = 10
-	if len(mwMutations.EnvVars) != 10 {
-		t.Fatalf("model weights: expected 10 env vars, got %d", len(mwMutations.EnvVars))
-	}
-	for _, env := range mwMutations.EnvVars {
-		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
-			t.Error("model weights concern should not include KV config")
-		}
-	}
-
-	// KV concern returns only KV mutations (no SI).
-	kvMutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("KV cache: unexpected error: %v", err)
-	}
-	if len(kvMutations.EnvVars) != 1 {
-		t.Fatalf("KV cache: expected 1 env var, got %d", len(kvMutations.EnvVars))
-	}
-	if kvMutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
-		t.Errorf("KV cache: expected VLLM_KV_TRANSFER_CONFIG, got %s", kvMutations.EnvVars[0].Name)
-	}
-	if len(kvMutations.InitContainers) != 0 {
-		t.Error("KV concern should not include init containers")
-	}
+p := newFakeProvider()
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeOpportunistic,
+},
+KVCache: &kaitov1beta1.KVCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeOpportunistic,
+},
+},
 }
 
-func TestPodMutations_ProviderConfigDisabled(t *testing.T) {
-	// When the provider's config disables a concern, it returns empty mutations.
-	scheme := runtime.NewScheme()
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{
-			cacheGVR: "CacheList",
-		})
-	cfg := DefaultConfig()
-	cfg.ModelWeightsEnabled = false
-	cfg.KVCacheEnabled = false
-	p := New(client, cfg)
+// Model weights concern: label + KAITO_MODEL_PATH only.
+mwMutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
+if err != nil {
+t.Fatalf("model weights: unexpected error: %v", err)
+}
+if len(mwMutations.EnvVars) != 1 || mwMutations.EnvVars[0].Name != "KAITO_MODEL_PATH" {
+t.Errorf("model weights should only have KAITO_MODEL_PATH, got %v", mwMutations.EnvVars)
+}
+for _, env := range mwMutations.EnvVars {
+if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
+t.Error("model weights concern should not include KV config")
+}
+}
 
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeRequired,
-			},
-			KVCache: &kaitov1beta1.KVCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeRequired,
-			},
-		},
-	}
+// KV concern: label + VLLM_KV_TRANSFER_CONFIG only.
+kvMutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
+if err != nil {
+t.Fatalf("KV cache: unexpected error: %v", err)
+}
+if len(kvMutations.EnvVars) != 1 || kvMutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
+t.Errorf("KV cache should only have VLLM_KV_TRANSFER_CONFIG, got %v", kvMutations.EnvVars)
+}
+if len(kvMutations.InitContainers) != 0 {
+t.Error("KV concern should not include init containers")
+}
+}
 
-	mw, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(mw.EnvVars) != 0 {
-		t.Errorf("expected 0 env vars when model weights disabled in config, got %d", len(mw.EnvVars))
-	}
+func TestPodMutations_KVCacheDisabled(t *testing.T) {
+scheme := runtime.NewScheme()
+client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+map[schema.GroupVersionResource]string{
+cacheGVR: "CacheList",
+})
+cfg := DefaultConfig()
+cfg.KVCacheEnabled = false
+p := New(client, cfg)
 
-	kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(kv.EnvVars) != 0 {
-		t.Errorf("expected 0 env vars when KV cache disabled in config, got %d", len(kv.EnvVars))
-	}
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+KVCache: &kaitov1beta1.KVCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeRequired,
+},
+},
+}
+
+kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if len(kv.EnvVars) != 0 {
+t.Errorf("expected 0 env vars when KV cache disabled, got %d", len(kv.EnvVars))
+}
+if len(kv.Labels) != 0 {
+t.Errorf("expected 0 labels when KV cache disabled, got %d", len(kv.Labels))
+}
 }
 
 func TestPodMutations_ConcernIsolation(t *testing.T) {
-	// Calling with KVCache concern does not produce model weight mutations.
-	p := newFakeProvider()
-	ws := &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeRequired,
-			},
-			KVCache: &kaitov1beta1.KVCacheConfig{
-				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeRequired,
-			},
-		},
-	}
+p := newFakeProvider()
+ws := &kaitov1beta1.Workspace{
+Cache: &kaitov1beta1.CacheSpec{
+ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeRequired,
+},
+KVCache: &kaitov1beta1.KVCacheConfig{
+Provider: "tachyon",
+Mode:     kaitov1beta1.CacheModeRequired,
+},
+},
+}
 
-	// KV concern must not return SI env vars or init containers.
-	kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(kv.InitContainers) != 0 {
-		t.Errorf("KV concern should not have init containers, got %d", len(kv.InitContainers))
-	}
-	for _, env := range kv.EnvVars {
-		if env.Name == "LD_PRELOAD" || env.Name == "SI_storagePath" || env.Name == "KAITO_MODEL_PATH" {
-			t.Errorf("KV concern should not include model weight env var %s", env.Name)
-		}
-	}
+// KV concern must not return model weight env vars.
+kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if len(kv.InitContainers) != 0 {
+t.Errorf("KV concern should not have init containers, got %d", len(kv.InitContainers))
+}
+for _, env := range kv.EnvVars {
+if env.Name == "KAITO_MODEL_PATH" {
+t.Errorf("KV concern should not include %s", env.Name)
+}
+}
 
-	// Model weights concern must not return KV env vars.
-	mw, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	for _, env := range mw.EnvVars {
-		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
-			t.Error("model weights concern should not include VLLM_KV_TRANSFER_CONFIG")
-		}
-	}
+// Model weights concern must not return KV env vars.
+mw, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+for _, env := range mw.EnvVars {
+if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
+t.Error("model weights concern should not include VLLM_KV_TRANSFER_CONFIG")
+}
+}
 }
 
 func TestCheckCacheReady(t *testing.T) {
-	tests := []struct {
-		name      string
-		obj       *unstructured.Unstructured
-		wantReady bool
-		wantMsg   string
-	}{
-		{
-			name:      "ready cache",
-			obj:       newReadyCache(),
-			wantReady: true,
-			wantMsg:   "cache is ready",
-		},
-		{
-			name: "not ready cache",
-			obj: &unstructured.Unstructured{
-				Object: map[string]interface{}{
-					"status": map[string]interface{}{
-						"conditions": []interface{}{
-							map[string]interface{}{
-								"type":   "Ready",
-								"status": "False",
-								"reason": "CacheInitializing",
-							},
-						},
-					},
-				},
-			},
-			wantReady: false,
-			wantMsg:   "cache not ready: CacheInitializing",
-		},
-		{
-			name: "no conditions",
-			obj: &unstructured.Unstructured{
-				Object: map[string]interface{}{
-					"status": map[string]interface{}{},
-				},
-			},
-			wantReady: false,
-			wantMsg:   "no status conditions found",
-		},
-	}
+tests := []struct {
+name      string
+obj       *unstructured.Unstructured
+wantReady bool
+wantMsg   string
+}{
+{
+name:      "ready cache",
+obj:       newReadyCache(),
+wantReady: true,
+wantMsg:   "cache is ready",
+},
+{
+name: "not ready cache",
+obj: &unstructured.Unstructured{
+Object: map[string]interface{}{
+"status": map[string]interface{}{
+"conditions": []interface{}{
+map[string]interface{}{
+"type":   "Ready",
+"status": "False",
+"reason": "CacheInitializing",
+},
+},
+},
+},
+},
+wantReady: false,
+wantMsg:   "cache not ready: CacheInitializing",
+},
+{
+name: "no conditions",
+obj: &unstructured.Unstructured{
+Object: map[string]interface{}{
+"status": map[string]interface{}{},
+},
+},
+wantReady: false,
+wantMsg:   "no status conditions found",
+},
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ready, msg := checkCacheReady(tt.obj)
-			if ready != tt.wantReady {
-				t.Errorf("ready: got %v, want %v", ready, tt.wantReady)
-			}
-			if msg != tt.wantMsg {
-				t.Errorf("msg: got %q, want %q", msg, tt.wantMsg)
-			}
-		})
-	}
+for _, tt := range tests {
+t.Run(tt.name, func(t *testing.T) {
+ready, msg := checkCacheReady(tt.obj)
+if ready != tt.wantReady {
+t.Errorf("ready: got %v, want %v", ready, tt.wantReady)
+}
+if msg != tt.wantMsg {
+t.Errorf("msg: got %q, want %q", msg, tt.wantMsg)
+}
+})
+}
 }
 
 func TestIsReady_NoCaches(t *testing.T) {
-	p := newFakeProvider()
-	ready, reason, err := p.IsReady(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ready {
-		t.Error("expected not ready when no caches exist")
-	}
-	if reason != "no Tachyon Cache CR found" {
-		t.Errorf("unexpected reason: %s", reason)
-	}
+p := newFakeProvider()
+ready, reason, err := p.IsReady(context.Background())
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if ready {
+t.Error("expected not ready when no caches exist")
+}
+if reason != "no Tachyon Cache CR found" {
+t.Errorf("unexpected reason: %s", reason)
+}
 }
 
 func TestIsReady_WithReadyCache(t *testing.T) {
-	cacheObj := newReadyCache()
+cacheObj := newReadyCache()
 
-	scheme := runtime.NewScheme()
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{
-			cacheGVR: "CacheList",
-		}, cacheObj)
-	p := New(client, DefaultConfig())
+scheme := runtime.NewScheme()
+client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+map[schema.GroupVersionResource]string{
+cacheGVR: "CacheList",
+}, cacheObj)
+p := New(client, DefaultConfig())
 
-	ready, reason, err := p.IsReady(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ready {
-		t.Errorf("expected ready, got not ready: %s", reason)
-	}
+ready, reason, err := p.IsReady(context.Background())
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if !ready {
+t.Errorf("expected ready, got not ready: %s", reason)
+}
 }
 
-// Ensure explicit registration works correctly.
 func TestExplicitRegistration(t *testing.T) {
-	p := newFakeProvider()
-	cache.Register(p)
+p := newFakeProvider()
+cache.Register(p)
 
-	got, err := cache.Get(kaitov1beta1.CacheProvider(ProviderName))
-	if err != nil {
-		t.Fatalf("tachyon provider not registered: %v", err)
-	}
-	if got.Name() != ProviderName {
-		t.Errorf("registered provider name: got %q, want %q", got.Name(), ProviderName)
-	}
+got, err := cache.Get(kaitov1beta1.CacheProvider(ProviderName))
+if err != nil {
+t.Fatalf("tachyon provider not registered: %v", err)
+}
+if got.Name() != ProviderName {
+t.Errorf("registered provider name: got %q, want %q", got.Name(), ProviderName)
+}
 }
 
 // Suppress unused import warning.

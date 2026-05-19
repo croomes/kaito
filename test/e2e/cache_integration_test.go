@@ -51,7 +51,7 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 	Context("Workspace with model weights cache", func() {
 		var workspaceObj *kaitov1beta1.Workspace
 
-		It("should inject StorageIntercept into inference pod", func() {
+		It("should inject cache label and KAITO_MODEL_PATH into inference pod", func() {
 			uniqueID := fmt.Sprint("cache-mw-", rand.Intn(1000))
 
 			By("Creating a workspace with model weights cache enabled")
@@ -109,7 +109,7 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 	Context("Workspace with both caches", func() {
 		var workspaceObj *kaitov1beta1.Workspace
 
-		It("should inject both StorageIntercept and KV config", func() {
+		It("should inject both cache label and KV config", func() {
 			uniqueID := fmt.Sprint("cache-both-", rand.Intn(1000))
 
 			By("Creating a workspace with both model weights and KV cache")
@@ -232,7 +232,7 @@ func generateCacheWorkspace(name, namespace string, cacheSpec kaitov1beta1.Cache
 }
 
 // validateCacheMutationsInStatefulSet checks that the StatefulSet pod template
-// has the expected StorageIntercept mutations.
+// has the expected cache mutations: injection label + KAITO_MODEL_PATH env var.
 func validateCacheMutationsInStatefulSet(workspaceObj *kaitov1beta1.Workspace) {
 	Eventually(func() bool {
 		sts := &appsv1.StatefulSet{}
@@ -245,35 +245,15 @@ func validateCacheMutationsInStatefulSet(workspaceObj *kaitov1beta1.Workspace) {
 			return false
 		}
 
-		podSpec := sts.Spec.Template.Spec
-
-		// Check init container.
-		hasInitContainer := false
-		for _, c := range podSpec.InitContainers {
-			if c.Name == "tachyon-lib-loader" {
-				hasInitContainer = true
-				break
-			}
-		}
-		if !hasInitContainer {
-			GinkgoWriter.Println("tachyon-lib-loader init container not found")
-			return false
-		}
-
-		// Check tachyon-lib volume.
-		hasVolume := false
-		for _, v := range podSpec.Volumes {
-			if v.Name == "tachyon-lib" {
-				hasVolume = true
-				break
-			}
-		}
-		if !hasVolume {
-			GinkgoWriter.Println("tachyon-lib volume not found")
+		// Check injection label on pod template.
+		labels := sts.Spec.Template.Labels
+		if labels == nil || labels["tachyon.azure.com/inject"] != "true" {
+			GinkgoWriter.Println("tachyon.azure.com/inject label not found on pod template")
 			return false
 		}
 
 		// Check env vars on first container.
+		podSpec := sts.Spec.Template.Spec
 		if len(podSpec.Containers) == 0 {
 			return false
 		}
@@ -282,38 +262,16 @@ func validateCacheMutationsInStatefulSet(workspaceObj *kaitov1beta1.Workspace) {
 			envMap[e.Name] = e.Value
 		}
 
-		requiredEnvs := []string{
-			"LD_PRELOAD",
-			"SI_storagePath",
-			"SI_type",
-			"SI_azBlobContainerName",
-			"SI_cacheEnable",
-			"SI_cacheServerDiscoveryEnabled",
-			"KAITO_MODEL_PATH",
-		}
-		for _, name := range requiredEnvs {
-			if _, ok := envMap[name]; !ok {
-				GinkgoWriter.Printf("Missing env var: %s\n", name)
-				return false
-			}
-		}
-
-		// Verify LD_PRELOAD points to tachyon lib.
-		if envMap["LD_PRELOAD"] != "/opt/tachyon/libStorageIntercept.so" {
-			GinkgoWriter.Printf("LD_PRELOAD has unexpected value: %s\n", envMap["LD_PRELOAD"])
-			return false
-		}
-
-		// Verify KAITO_MODEL_PATH starts with /mnt/models/.
+		// Verify KAITO_MODEL_PATH is set and starts with /mnt/models/.
 		modelPath := envMap["KAITO_MODEL_PATH"]
 		if len(modelPath) < 12 || modelPath[:12] != "/mnt/models/" {
-			GinkgoWriter.Printf("KAITO_MODEL_PATH has unexpected prefix: %s\n", modelPath)
+			GinkgoWriter.Printf("KAITO_MODEL_PATH has unexpected value: %s\n", modelPath)
 			return false
 		}
 
 		return true
 	}, 15*time.Minute, utils.PollInterval).Should(BeTrue(),
-		"StatefulSet should have StorageIntercept cache mutations")
+		"StatefulSet should have cache injection label and KAITO_MODEL_PATH")
 }
 
 // validateKVCacheEnvVar checks that VLLM_KV_TRANSFER_CONFIG env var is set.

@@ -13,17 +13,18 @@
 
 // Package tachyon implements the cache.Provider interface for the Tachyon
 // distributed NVMe cache service. It manages Cache CRs in the tachyon-cache-system
-// namespace and injects the necessary env vars for StorageIntercept (model weights)
-// and TachyonKVConnector (KV cache) into inference pods.
+// namespace and configures inference pods for cache access via webhook-based injection.
+//
+// The Tachyon CSI driver + mutating webhook handles all library staging and pod injection.
+// KAITO's role is to: add the injection label, set KAITO_MODEL_PATH, and configure
+// the vLLM KV transfer config.
 package tachyon
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -46,6 +47,12 @@ const (
 	// Discovery endpoint for Tachyon cache servers.
 	DefaultDiscoveryEndpoint = "http://cacheserver-discovery.tachyon-cache-system.svc.cluster.local:9065"
 	DefaultDiscoveryPort     = 9065
+
+	// InjectLabelKey is the pod label that triggers the Tachyon mutating webhook
+	// to inject cache libraries, LD_PRELOAD, and StorageIntercept config.
+	InjectLabelKey = "tachyon.azure.com/inject"
+	// InjectLabelValue is the value that enables injection.
+	InjectLabelValue = "true"
 )
 
 var cacheGVR = schema.GroupVersionResource{
@@ -59,64 +66,33 @@ type Config struct {
 	// DiscoveryEndpoint overrides the default cache server discovery endpoint.
 	DiscoveryEndpoint string
 
-	// ModelWeightsEnabled controls whether model weight caching is supported.
-	ModelWeightsEnabled bool
-
 	// KVCacheEnabled controls whether KV caching is supported.
 	KVCacheEnabled bool
 
 	// KVConnectorProtocol is the transport protocol for KV cache (e.g., "rdma", "tcp").
 	KVConnectorProtocol string
 
-	// BlobEndpoint is the Azure Blob Storage endpoint (e.g., "https://account.blob.core.windows.net").
+	// BlobEndpoint is the Azure Blob Storage endpoint (used by prewarm Jobs).
 	BlobEndpoint string
 
-	// BlobStorageAccountName is the Azure storage account name.
-	// If empty, it is extracted from BlobEndpoint.
-	BlobStorageAccountName string
-
-	// BlobContainer is the blob container used for model weight storage.
+	// BlobContainer is the blob container used for model weight storage (used by prewarm Jobs).
 	BlobContainer string
 
 	// BlobPrefix is the path prefix within the container (defaults to "kaito-models").
 	BlobPrefix string
 
-	// StorageInterceptImage is the container image that contains libStorageIntercept.so.
-	// An init container copies the library from this image into a shared volume.
-	StorageInterceptImage string
-
-	// StorageInterceptLibPath is the path to libStorageIntercept.so within the StorageInterceptImage.
-	StorageInterceptLibPath string
-
 	// PrewarmImage is the container image used for prewarm Jobs.
 	PrewarmImage string
 }
 
-const (
-	// DefaultStorageInterceptImage is the default image containing libStorageIntercept.so.
-	DefaultStorageInterceptImage = "tachyontestacr.azurecr.io/cache-client-base:latest"
-
-	// DefaultStorageInterceptLibPath is the default path to the .so in the SI image.
-	DefaultStorageInterceptLibPath = "/lib/libStorageIntercept.so"
-
-	// cacheLibVolumeName is the shared volume for Tachyon client libraries (SI + KV).
-	cacheLibVolumeName = "tachyon-lib"
-
-	// cacheLibMountPath is where Tachyon libraries are mounted in the inference container.
-	cacheLibMountPath = "/opt/tachyon"
-)
-
 // DefaultConfig returns sensible defaults for Tachyon integration.
 func DefaultConfig() Config {
 	return Config{
-		DiscoveryEndpoint:       DefaultDiscoveryEndpoint,
-		ModelWeightsEnabled:     true,
-		KVCacheEnabled:          true,
-		KVConnectorProtocol:     "tcp",
-		BlobContainer:           "kaito-models",
-		BlobPrefix:              DefaultBlobPrefix,
-		StorageInterceptImage:   DefaultStorageInterceptImage,
-		StorageInterceptLibPath: DefaultStorageInterceptLibPath,
+		DiscoveryEndpoint:   DefaultDiscoveryEndpoint,
+		KVCacheEnabled:      true,
+		KVConnectorProtocol: "tcp",
+		BlobContainer:       "kaito-models",
+		BlobPrefix:          DefaultBlobPrefix,
 	}
 }
 
@@ -169,56 +145,21 @@ func (p *Provider) IsReady(ctx context.Context) (bool, string, error) {
 }
 
 // PodMutations returns the pod-level changes needed for the requested cache concern.
-// For ModelWeights: injects an init container (copies libStorageIntercept.so),
-// shared volume, LD_PRELOAD, StorageIntercept config env vars, and KAITO_MODEL_PATH.
-// For KVCache: injects the vLLM KV transfer config env var.
+// For ModelWeights: adds the Tachyon injection label and sets KAITO_MODEL_PATH.
+// The Tachyon mutating webhook handles all library injection when it sees the label.
+// For KVCache: adds the injection label and the vLLM KV transfer config env var.
 func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*cache.PodMutations, error) {
 	mutations := &cache.PodMutations{}
 
 	switch concern {
 	case cache.CacheConcernModelWeights:
-		if !p.config.ModelWeightsEnabled {
-			return mutations, nil
+		// Add label to trigger Tachyon webhook injection.
+		mutations.Labels = map[string]string{
+			InjectLabelKey: InjectLabelValue,
 		}
 
-		siImage := p.config.StorageInterceptImage
-		if siImage == "" {
-			siImage = DefaultStorageInterceptImage
-		}
-		siLibPath := p.config.StorageInterceptLibPath
-		if siLibPath == "" {
-			siLibPath = DefaultStorageInterceptLibPath
-		}
-
-		// Init container: copy libStorageIntercept.so to shared volume.
-		mutations.InitContainers = append(mutations.InitContainers, corev1.Container{
-			Name:    "tachyon-lib-loader",
-			Image:   siImage,
-			Command: []string{"cp", siLibPath, cacheLibMountPath + "/libStorageIntercept.so"},
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: cacheLibVolumeName, MountPath: cacheLibMountPath},
-			},
-		})
-
-		// Shared emptyDir volume for the library.
-		mutations.Volumes = append(mutations.Volumes, corev1.Volume{
-			Name: cacheLibVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		})
-
-		// Mount the library volume into the inference container.
-		mutations.VolumeMounts = append(mutations.VolumeMounts, corev1.VolumeMount{
-			Name:      cacheLibVolumeName,
-			MountPath: cacheLibMountPath,
-			ReadOnly:  true,
-		})
-
-		// StorageIntercept env vars.
-		mutations.EnvVars = append(mutations.EnvVars, storageInterceptEnvVars(p.config)...)
-
-		// Model local path (the path vLLM will use as --model).
+		// Set the model path that vLLM will use as --model.
+		// StorageIntercept (injected by webhook) intercepts reads under this path.
 		if modelName != "" {
 			localPath := ModelLocalPath(DefaultStoragePath, p.config.BlobPrefix, modelName, modelRevision)
 			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
@@ -230,6 +171,11 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 	case cache.CacheConcernKVCache:
 		if !p.config.KVCacheEnabled {
 			return mutations, nil
+		}
+
+		// Add label to trigger Tachyon webhook injection (needed for KV connector libs).
+		mutations.Labels = map[string]string{
+			InjectLabelKey: InjectLabelValue,
 		}
 
 		kvEnvVars, err := kvCacheEnvVars(p.config.DiscoveryEndpoint, p.config.KVConnectorProtocol)
@@ -264,57 +210,23 @@ func (p *Provider) Cleanup(ctx context.Context, req cache.PrewarmRequest) error 
 	return nil
 }
 
-// storageInterceptEnvVars returns the env vars needed to configure StorageIntercept.
-// These tell SI where to intercept filesystem reads and how to reach blob + cache.
-func storageInterceptEnvVars(cfg Config) []corev1.EnvVar {
-	accountName := cfg.BlobStorageAccountName
-	if accountName == "" {
-		accountName = extractAccountName(cfg.BlobEndpoint)
-	}
-
-	return []corev1.EnvVar{
-		{Name: "LD_PRELOAD", Value: cacheLibMountPath + "/libStorageIntercept.so"},
-		{Name: "SI_storagePath", Value: DefaultStoragePath},
-		{Name: "SI_type", Value: "blob"},
-		{Name: "SI_azBlobStorageAccName", Value: accountName},
-		{Name: "SI_azBlobStorageEndpointUrl", Value: cfg.BlobEndpoint},
-		{Name: "SI_azBlobContainerName", Value: cfg.BlobContainer},
-		{Name: "SI_cacheEnable", Value: "true"},
-		{Name: "SI_cacheServerDiscoveryEnabled", Value: "true"},
-		{Name: "SI_cacheServerDiscoveryEndpoint", Value: cfg.DiscoveryEndpoint},
-	}
-}
-
-// extractAccountName extracts the storage account name from a blob endpoint URL.
-// For "https://myaccount.blob.core.windows.net", returns "myaccount".
-func extractAccountName(endpoint string) string {
-	if endpoint == "" {
-		return ""
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return ""
-	}
-	parts := strings.SplitN(u.Hostname(), ".", 2)
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return ""
-}
-
-// kvTransferConfig is the JSON structure expected by vLLM's --kv-transfer-config flag.
+// kvTransferConfig is the JSON structure expected by vLLM v1's --kv-transfer-config flag.
 type kvTransferConfig struct {
-	KVConnector  string `json:"kv_connector"`
-	LocatorNodes string `json:"locator_nodes"`
-	Protocol     string `json:"protocol"`
+	KVConnector           string                 `json:"kv_connector"`
+	KVConnectorExtraConfig map[string]interface{} `json:"kv_connector_extra_config"`
 }
 
-// kvCacheEnvVars returns the env var for vLLM KV transfer config.
+// kvCacheEnvVars returns the env var for vLLM KV transfer config (v1 format).
 func kvCacheEnvVars(discoveryEndpoint, protocol string) ([]corev1.EnvVar, error) {
 	cfg := kvTransferConfig{
-		KVConnector:  "TachyonKVConnector",
-		LocatorNodes: discoveryEndpoint,
-		Protocol:     protocol,
+		KVConnector: "py_tachyon_client.connectors.vllm_connector.TachyonKVConnector",
+		KVConnectorExtraConfig: map[string]interface{}{
+			"locator_nodes":   discoveryEndpoint,
+			"protocol":        protocol,
+			"initial_ttl_ms":  300000,
+			"producer_ttl_ms": 1800000,
+			"max_ttl_ms":      86400000,
+		},
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -358,9 +270,6 @@ func ConfigFromEnv() Config {
 	if v := os.Getenv("TACHYON_DISCOVERY_ENDPOINT"); v != "" {
 		cfg.DiscoveryEndpoint = v
 	}
-	if v := os.Getenv("TACHYON_MODEL_WEIGHTS_ENABLED"); v != "" {
-		cfg.ModelWeightsEnabled = v == "true"
-	}
 	if v := os.Getenv("TACHYON_KV_CACHE_ENABLED"); v != "" {
 		cfg.KVCacheEnabled = v == "true"
 	}
@@ -375,12 +284,6 @@ func ConfigFromEnv() Config {
 	}
 	if v := os.Getenv("TACHYON_BLOB_PREFIX"); v != "" {
 		cfg.BlobPrefix = v
-	}
-	if v := os.Getenv("TACHYON_STORAGE_INTERCEPT_IMAGE"); v != "" {
-		cfg.StorageInterceptImage = v
-	}
-	if v := os.Getenv("TACHYON_STORAGE_INTERCEPT_LIB_PATH"); v != "" {
-		cfg.StorageInterceptLibPath = v
 	}
 	if v := os.Getenv("TACHYON_PREWARM_IMAGE"); v != "" {
 		cfg.PrewarmImage = v
