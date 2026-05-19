@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -124,10 +125,21 @@ func collectMutations(ctx context.Context, ws *kaitov1beta1.Workspace, modelName
 	return merged, nil
 }
 
-// mergeMutations appends src mutations into dst, deduplicating env vars by name.
+// mergeMutations appends src mutations into dst, deduplicating env vars by name
+// and merging labels.
 func mergeMutations(dst, src *PodMutations) {
 	if src == nil {
 		return
+	}
+
+	// Merge labels.
+	if len(src.Labels) > 0 {
+		if dst.Labels == nil {
+			dst.Labels = make(map[string]string, len(src.Labels))
+		}
+		for k, v := range src.Labels {
+			dst.Labels[k] = v
+		}
 	}
 
 	// Deduplicate env vars by name (last wins).
@@ -160,4 +172,54 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 	// Inject volumes and init containers at the pod level.
 	spec.Volumes = append(spec.Volumes, mutations.Volumes...)
 	spec.InitContainers = append(spec.InitContainers, mutations.InitContainers...)
+}
+
+// SetCachePodTemplateLabels returns a StatefulSet modifier that adds cache-related
+// labels to the pod template metadata. This enables webhook-based injection where
+// the cache provider's mutating webhook detects the label and injects necessary
+// volumes, mounts, and environment variables.
+func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, appsv1.StatefulSet] {
+	return func(ctx *generator.WorkspaceGeneratorContext, ss *appsv1.StatefulSet) error {
+		if !featuregates.FeatureGates[consts.FeatureFlagDistributedCache] {
+			return nil
+		}
+
+		ws := ctx.Workspace
+		if ws.Cache == nil {
+			return nil
+		}
+
+		var modelName, modelRevision string
+		if ctx.Model != nil {
+			params := ctx.Model.GetInferenceParameters()
+			if params != nil {
+				modelName = params.Name
+				if params.Version != "" {
+					_, revision, err := utils.ParseHuggingFaceModelVersion(params.Version)
+					if err == nil {
+						modelRevision = revision
+					}
+				}
+				if modelName == "" && ws.Inference != nil && ws.Inference.Preset != nil {
+					modelName = string(ws.Inference.Preset.Name)
+				}
+			}
+		}
+
+		mutations, err := collectMutations(ctx.Ctx, ws, modelName, modelRevision)
+		if err != nil {
+			return fmt.Errorf("collecting cache label mutations: %w", err)
+		}
+
+		if mutations != nil && len(mutations.Labels) > 0 {
+			if ss.Spec.Template.Labels == nil {
+				ss.Spec.Template.Labels = make(map[string]string)
+			}
+			for k, v := range mutations.Labels {
+				ss.Spec.Template.Labels[k] = v
+			}
+		}
+
+		return nil
+	}
 }

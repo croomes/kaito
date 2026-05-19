@@ -176,24 +176,20 @@ local-csi-driver:
 
 # Distributed cache provider configuration.
 # Only active when featureGates.distributedCache is true.
+# The Tachyon CSI driver + mutating webhook must be pre-installed in the cluster.
+# KAITO adds pod labels to trigger webhook-based cache library injection.
 cache:
   providers:
     tachyon:
       enabled: false
       discoveryEndpoint: "http://cacheserver-discovery.tachyon-cache-system.svc.cluster.local:9065"
-      modelWeightsEnabled: true
       kvCacheEnabled: true
       kvConnectorProtocol: "tcp"
-      # Azure Blob Storage endpoint for model weight caching.
-      # Required when modelWeightsEnabled is true.
+      # Azure Blob Storage endpoint (used by prewarm Jobs).
       blobEndpoint: ""
       # Blob container for model weight storage.
       blobContainer: "kaito-models"
       # Path prefix within the blob container.
       blobPrefix: "kaito-models"
-      # Container image containing libStorageIntercept.so (init container copies it to inference pod).
-      storageInterceptImage: "tachyontestacr.azurecr.io/cache-client-base:latest"
-      # Path to libStorageIntercept.so within the storageInterceptImage.
-      storageInterceptLibPath: "/lib/libStorageIntercept.so"
       # Container image used for prewarm Jobs (downloads from HF, uploads to cache).
       prewarmImage: ""

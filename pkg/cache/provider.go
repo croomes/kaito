@@ -34,6 +34,9 @@ const (
 // Supports both env-var-based (e.g., storage interception libraries) and
 // mount-based (e.g., FUSE, PVC) cache integrations.
 type PodMutations struct {
+	// Labels to add to the pod template metadata.
+	// Used to trigger webhook-based injection (e.g., tachyon.azure.com/inject: "true").
+	Labels map[string]string
 	// EnvVars to inject into model containers.
 	EnvVars []corev1.EnvVar
 	// Volumes to add to the pod spec.

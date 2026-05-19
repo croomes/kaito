@@ -196,6 +196,11 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 		manifests.GenerateStatefulSetManifest(revisionNum, numNodes),
 	}
 
+	// Add cache pod template labels (for webhook-based injection).
+	if workspaceObj.Cache != nil {
+		ssOpts = append(ssOpts, cache.SetCachePodTemplateLabels())
+	}
+
 	if checkIfNVMeAvailable(ctx, gpuConfig, kubeClient) {
 		ssOpts = append(ssOpts, manifests.AddStatefulSetVolumeClaimTemplates(GenerateModelWeightsCacheVolume(ctx, workspaceObj, model)))
 	} else {
