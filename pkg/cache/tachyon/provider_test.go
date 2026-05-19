@@ -113,8 +113,8 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 		"LD_PRELOAD":                       "/opt/tachyon/libStorageIntercept.so",
 		"SI_storagePath":                   "/mnt/models",
 		"SI_type":                          "blob",
-		"SI_azBlobStorageAccountName":      "",
-		"SI_azBlobStorageEndpoint":         "",
+		"SI_azBlobStorageAccName":      "",
+		"SI_azBlobStorageEndpointUrl":         "",
 		"SI_azBlobContainerName":           "kaito-models",
 		"SI_cacheEnable":                   "true",
 		"SI_cacheServerDiscoveryEnabled":   "true",
@@ -166,10 +166,10 @@ func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
 	var modelPathFound bool
 	for _, env := range mutations.EnvVars {
 		switch env.Name {
-		case "SI_azBlobStorageAccountName":
+		case "SI_azBlobStorageAccName":
 			accountNameFound = true
 			if env.Value != "myaccount" {
-				t.Errorf("SI_azBlobStorageAccountName: expected %q, got %q", "myaccount", env.Value)
+				t.Errorf("SI_azBlobStorageAccName: expected %q, got %q", "myaccount", env.Value)
 			}
 		case "SI_azBlobContainerName":
 			if env.Value != "models" {
@@ -184,7 +184,7 @@ func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
 		}
 	}
 	if !accountNameFound {
-		t.Error("SI_azBlobStorageAccountName env var not found")
+		t.Error("SI_azBlobStorageAccName env var not found")
 	}
 	if !modelPathFound {
 		t.Error("KAITO_MODEL_PATH env var not found")

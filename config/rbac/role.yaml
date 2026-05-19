@@ -7,20 +7,8 @@ rules:
 - apiGroups:
   - kaito.sh
   resources:
-  - workspaces
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - kaito.sh
-  resources:
   - inferencesets
-  - inferencesets/status
+  - multiroleinferences
   verbs:
   - create
   - delete
@@ -32,21 +20,14 @@ rules:
 - apiGroups:
   - kaito.sh
   resources:
-  - multiroleinferences
+  - multiroleinferences/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - kaito.sh
+  resources:
   - multiroleinferences/status
   verbs:
-  - create
-  - delete
   - get
-  - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - get
-  - list
-  - watch
