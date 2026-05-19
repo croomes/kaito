@@ -178,7 +178,9 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 			InjectLabelKey: InjectLabelValue,
 		}
 
-		kvEnvVars, err := kvCacheEnvVars(p.config.DiscoveryEndpoint, p.config.KVConnectorProtocol)
+		// Resolve discovery endpoint (from config or auto-discovered from Cache CR).
+		endpoint := p.resolveDiscoveryEndpoint(ctx)
+		kvEnvVars, err := kvCacheEnvVars(endpoint, p.config.KVConnectorProtocol)
 		if err != nil {
 			return nil, fmt.Errorf("building KV cache env vars: %w", err)
 		}
@@ -186,6 +188,30 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 	}
 
 	return mutations, nil
+}
+
+// resolveDiscoveryEndpoint returns the discovery endpoint, auto-discovering from
+// the Cache CR status if not explicitly configured.
+func (p *Provider) resolveDiscoveryEndpoint(ctx context.Context) string {
+	if p.config.DiscoveryEndpoint != "" {
+		return p.config.DiscoveryEndpoint
+	}
+
+	// Attempt to read from Cache CR status.
+	caches, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil || len(caches.Items) == 0 {
+		klog.V(4).InfoS("Could not auto-discover endpoint, using default", "error", err)
+		return DefaultDiscoveryEndpoint
+	}
+
+	endpoint, found, err := unstructured.NestedString(caches.Items[0].Object, "status", "discoveryEndpoint")
+	if err != nil || !found || endpoint == "" {
+		klog.V(4).InfoS("Cache CR has no discoveryEndpoint in status, using default")
+		return DefaultDiscoveryEndpoint
+	}
+
+	klog.V(3).InfoS("Auto-discovered cache endpoint from CR status", "endpoint", endpoint)
+	return endpoint
 }
 
 // Prewarm creates a prewarm Job for the specified model if one doesn't already exist.
