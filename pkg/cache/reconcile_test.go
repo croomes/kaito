@@ -141,7 +141,7 @@ func (p *noopTestProvider) IsAvailable(_ context.Context) (bool, error)   { retu
 func (p *noopTestProvider) IsReady(_ context.Context) (bool, string, error) {
 	return true, "always ready", nil
 }
-func (p *noopTestProvider) PodMutations(_ context.Context, _ *kaitov1beta1.Workspace, _, _ string) (*PodMutations, error) {
+func (p *noopTestProvider) PodMutations(_ context.Context, _ CacheConcern, _ *kaitov1beta1.Workspace, _, _ string) (*PodMutations, error) {
 	return &PodMutations{}, nil
 }
 func (p *noopTestProvider) Prewarm(_ context.Context, _ PrewarmRequest) error  { return nil }

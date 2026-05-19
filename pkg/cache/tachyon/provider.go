@@ -167,19 +167,19 @@ func (p *Provider) IsReady(ctx context.Context) (bool, string, error) {
 	return ready, reason, nil
 }
 
-// PodMutations returns the pod-level changes needed to enable Tachyon caching.
-// For model weights: injects an init container (copies libStorageIntercept.so),
+// PodMutations returns the pod-level changes needed for the requested cache concern.
+// For ModelWeights: injects an init container (copies libStorageIntercept.so),
 // shared volume, LD_PRELOAD, StorageIntercept config env vars, and KAITO_MODEL_PATH.
-// For KV cache: injects the vLLM KV transfer config env var.
-func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*cache.PodMutations, error) {
+// For KVCache: injects the vLLM KV transfer config env var.
+func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*cache.PodMutations, error) {
 	mutations := &cache.PodMutations{}
 
-	if workspace.Cache == nil {
-		return mutations, nil
-	}
+	switch concern {
+	case cache.CacheConcernModelWeights:
+		if !p.config.ModelWeightsEnabled {
+			return mutations, nil
+		}
 
-	// Model weights cache: StorageIntercept library + config.
-	if workspace.Cache.ModelWeights != nil && workspace.Cache.ModelWeights.Mode != kaitov1beta1.CacheModeDisabled && p.config.ModelWeightsEnabled {
 		siImage := p.config.StorageInterceptImage
 		if siImage == "" {
 			siImage = DefaultStorageInterceptImage
@@ -225,10 +225,12 @@ func (p *Provider) PodMutations(ctx context.Context, workspace *kaitov1beta1.Wor
 				Value: localPath,
 			})
 		}
-	}
 
-	// KV cache env vars (vLLM KV connector config).
-	if workspace.Cache.KVCache != nil && workspace.Cache.KVCache.Mode != kaitov1beta1.CacheModeDisabled && p.config.KVCacheEnabled {
+	case cache.CacheConcernKVCache:
+		if !p.config.KVCacheEnabled {
+			return mutations, nil
+		}
+
 		kvEnvVars, err := kvCacheEnvVars(p.config.DiscoveryEndpoint, p.config.KVConnectorProtocol)
 		if err != nil {
 			return nil, fmt.Errorf("building KV cache env vars: %w", err)

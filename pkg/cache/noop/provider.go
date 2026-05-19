@@ -39,7 +39,7 @@ func (p *Provider) IsReady(_ context.Context) (bool, string, error) {
 	return true, "noop provider is always ready", nil
 }
 
-func (p *Provider) PodMutations(_ context.Context, _ *kaitov1beta1.Workspace, _, _ string) (*cache.PodMutations, error) {
+func (p *Provider) PodMutations(_ context.Context, _ cache.CacheConcern, _ *kaitov1beta1.Workspace, _, _ string) (*cache.PodMutations, error) {
 	return &cache.PodMutations{}, nil
 }
 

@@ -22,6 +22,14 @@ import (
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 )
 
+// CacheConcern identifies which cache concern a provider is being asked about.
+type CacheConcern string
+
+const (
+	CacheConcernModelWeights CacheConcern = "ModelWeights"
+	CacheConcernKVCache      CacheConcern = "KVCache"
+)
+
 // PodMutations describes all pod-level changes needed to enable cache access.
 // Supports both env-var-based (e.g., storage interception libraries) and
 // mount-based (e.g., FUSE, PVC) cache integrations.
@@ -79,11 +87,10 @@ type Provider interface {
 	// Returns (ready, reason, error).
 	IsReady(ctx context.Context) (bool, string, error)
 
-	// PodMutations returns the pod-level changes needed to enable cache
-	// access for a given workspace and model (env vars, volumes, mounts, init containers).
-	// The modelName and modelRevision are used by providers that need to derive
-	// model-specific paths (e.g., blob storage paths for model weight caching).
-	PodMutations(ctx context.Context, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*PodMutations, error)
+	// PodMutations returns the pod-level changes needed for a specific cache
+	// concern (ModelWeights or KVCache). The provider should only return
+	// mutations relevant to the requested concern.
+	PodMutations(ctx context.Context, concern CacheConcern, workspace *kaitov1beta1.Workspace, modelName, modelRevision string) (*PodMutations, error)
 
 	// Prewarm triggers cache population for the specified model.
 	// Can be called by the workspace controller (on deploy with prewarmOnDeploy)

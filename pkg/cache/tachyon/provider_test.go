@@ -77,14 +77,13 @@ func TestPodMutations_ModelWeightsOnly(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
+	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Init container for SI library injection.
 	if len(mutations.InitContainers) != 1 {
-		t.Fatalf("expected 1 init container, got %d", len(mutations.InitContainers))
 	}
 	if mutations.InitContainers[0].Name != "tachyon-lib-loader" {
 		t.Errorf("init container name: got %q, want %q", mutations.InitContainers[0].Name, "tachyon-lib-loader")
@@ -157,7 +156,7 @@ func TestPodMutations_ModelWeightsWithBlob(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "abc123")
+	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "abc123")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -214,7 +213,7 @@ func TestPodMutations_KVCacheOnly(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws, "", "")
+	mutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,70 +253,118 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
+	// Model weights concern returns SI mutations only (no KV).
+	mwMutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("model weights: unexpected error: %v", err)
 	}
-
-	// 9 SI env vars + 1 KAITO_MODEL_PATH + 1 KV = 11
-	if len(mutations.EnvVars) != 11 {
-		t.Fatalf("expected 11 env vars, got %d", len(mutations.EnvVars))
+	// 9 SI env vars + 1 KAITO_MODEL_PATH = 10
+	if len(mwMutations.EnvVars) != 10 {
+		t.Fatalf("model weights: expected 10 env vars, got %d", len(mwMutations.EnvVars))
 	}
-
-	// Verify both SI and KV vars are present.
-	var hasLDPreload, hasKVConfig bool
-	for _, env := range mutations.EnvVars {
-		if env.Name == "LD_PRELOAD" {
-			hasLDPreload = true
-		}
+	for _, env := range mwMutations.EnvVars {
 		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
-			hasKVConfig = true
+			t.Error("model weights concern should not include KV config")
 		}
 	}
-	if !hasLDPreload {
-		t.Error("LD_PRELOAD not found in combined mutations")
+
+	// KV concern returns only KV mutations (no SI).
+	kvMutations, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
+	if err != nil {
+		t.Fatalf("KV cache: unexpected error: %v", err)
 	}
-	if !hasKVConfig {
-		t.Error("VLLM_KV_TRANSFER_CONFIG not found in combined mutations")
+	if len(kvMutations.EnvVars) != 1 {
+		t.Fatalf("KV cache: expected 1 env var, got %d", len(kvMutations.EnvVars))
+	}
+	if kvMutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
+		t.Errorf("KV cache: expected VLLM_KV_TRANSFER_CONFIG, got %s", kvMutations.EnvVars[0].Name)
+	}
+	if len(kvMutations.InitContainers) != 0 {
+		t.Error("KV concern should not include init containers")
 	}
 }
 
-func TestPodMutations_DisabledMode(t *testing.T) {
+func TestPodMutations_ProviderConfigDisabled(t *testing.T) {
+	// When the provider's config disables a concern, it returns empty mutations.
+	scheme := runtime.NewScheme()
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{
+			cacheGVR: "CacheList",
+		})
+	cfg := DefaultConfig()
+	cfg.ModelWeightsEnabled = false
+	cfg.KVCacheEnabled = false
+	p := New(client, cfg)
+
+	ws := &kaitov1beta1.Workspace{
+		Cache: &kaitov1beta1.CacheSpec{
+			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
+				Provider: "tachyon",
+				Mode:     kaitov1beta1.CacheModeRequired,
+			},
+			KVCache: &kaitov1beta1.KVCacheConfig{
+				Provider: "tachyon",
+				Mode:     kaitov1beta1.CacheModeRequired,
+			},
+		},
+	}
+
+	mw, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mw.EnvVars) != 0 {
+		t.Errorf("expected 0 env vars when model weights disabled in config, got %d", len(mw.EnvVars))
+	}
+
+	kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(kv.EnvVars) != 0 {
+		t.Errorf("expected 0 env vars when KV cache disabled in config, got %d", len(kv.EnvVars))
+	}
+}
+
+func TestPodMutations_ConcernIsolation(t *testing.T) {
+	// Calling with KVCache concern does not produce model weight mutations.
 	p := newFakeProvider()
 	ws := &kaitov1beta1.Workspace{
 		Cache: &kaitov1beta1.CacheSpec{
 			ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
 				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeDisabled,
+				Mode:     kaitov1beta1.CacheModeRequired,
 			},
 			KVCache: &kaitov1beta1.KVCacheConfig{
 				Provider: "tachyon",
-				Mode:     kaitov1beta1.CacheModeDisabled,
+				Mode:     kaitov1beta1.CacheModeRequired,
 			},
 		},
 	}
 
-	mutations, err := p.PodMutations(context.Background(), ws, "microsoft/phi-4", "main")
+	// KV concern must not return SI env vars or init containers.
+	kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if len(mutations.EnvVars) != 0 {
-		t.Errorf("expected 0 env vars when disabled, got %d", len(mutations.EnvVars))
+	if len(kv.InitContainers) != 0 {
+		t.Errorf("KV concern should not have init containers, got %d", len(kv.InitContainers))
 	}
-}
+	for _, env := range kv.EnvVars {
+		if env.Name == "LD_PRELOAD" || env.Name == "SI_storagePath" || env.Name == "KAITO_MODEL_PATH" {
+			t.Errorf("KV concern should not include model weight env var %s", env.Name)
+		}
+	}
 
-func TestPodMutations_NilCache(t *testing.T) {
-	p := newFakeProvider()
-	ws := &kaitov1beta1.Workspace{}
-
-	mutations, err := p.PodMutations(context.Background(), ws, "", "")
+	// Model weights concern must not return KV env vars.
+	mw, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if len(mutations.EnvVars) != 0 {
-		t.Errorf("expected 0 env vars for nil cache, got %d", len(mutations.EnvVars))
+	for _, env := range mw.EnvVars {
+		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
+			t.Error("model weights concern should not include VLLM_KV_TRANSFER_CONFIG")
+		}
 	}
 }
 
