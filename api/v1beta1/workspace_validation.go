@@ -805,4 +805,3 @@ func (k *KVCacheConfig) validateCreate() (errs *apis.FieldError) {
 	}
 	return errs
 }
-}
