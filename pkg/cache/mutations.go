@@ -223,3 +223,34 @@ func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.Works
 		return nil
 	}
 }
+
+// ApplyTemplateCacheMutations applies cache mutations (labels, env vars, volumes)
+// to a StatefulSet generated from a custom pod template. This is the equivalent
+// of SetCacheMutations + SetCachePodTemplateLabels for the template inference path.
+func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, ss *appsv1.StatefulSet) {
+	if ws.Cache == nil {
+		return
+	}
+
+	mutations, err := collectMutations(ctx, ws, "", "")
+	if err != nil {
+		klog.V(2).InfoS("Failed to collect cache mutations for template inference", "error", err)
+		return
+	}
+	if mutations == nil {
+		return
+	}
+
+	// Apply labels to pod template for webhook-based injection.
+	if len(mutations.Labels) > 0 {
+		if ss.Spec.Template.Labels == nil {
+			ss.Spec.Template.Labels = make(map[string]string)
+		}
+		for k, v := range mutations.Labels {
+			ss.Spec.Template.Labels[k] = v
+		}
+	}
+
+	// Apply env vars, volumes, and mounts to the pod spec.
+	applyMutations(&ss.Spec.Template.Spec, mutations)
+}
