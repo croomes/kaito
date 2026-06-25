@@ -51,7 +51,7 @@ import (
 	autoupgrade "github.com/kaito-project/kaito/pkg/controllers/autoupgrade"
 	"github.com/kaito-project/kaito/pkg/cache"
 	cachenoop "github.com/kaito-project/kaito/pkg/cache/noop"
-	"github.com/kaito-project/kaito/pkg/cache/tachyon"
+	"github.com/kaito-project/kaito/pkg/cache/dacs"
 	drift "github.com/kaito-project/kaito/pkg/controllers/drift"
 	multiroleinference "github.com/kaito-project/kaito/pkg/controllers/multiroleinference"
 	"github.com/kaito-project/kaito/pkg/featuregates"
@@ -209,10 +209,10 @@ func main() {
 			klog.ErrorS(dynErr, "unable to create dynamic client for cache providers")
 			exitWithErrorFunc()
 		}
-		tachyonCfg := tachyon.ConfigFromEnv()
-		cache.Register(tachyon.New(dynamicClient, tachyonCfg))
-		klog.InfoS("Registered Tachyon cache provider", "discoveryEndpoint", tachyonCfg.DiscoveryEndpoint,
-			"kvCacheEnabled", tachyonCfg.KVCacheEnabled)
+		dacsCfg := dacs.ConfigFromEnv()
+		cache.Register(dacs.New(dynamicClient, dacsCfg))
+		klog.InfoS("Registered DACS cache provider", "discoveryEndpoint", dacsCfg.DiscoveryEndpoint,
+			"kvCacheEnabled", dacsCfg.KVCacheEnabled)
 	}
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -306,6 +306,15 @@ func main() {
 	if err = workspaceReconciler.SetupWithManager(mgr); err != nil {
 		klog.ErrorS(err, "unable to create controller", "controller", "Workspace")
 		exitWithErrorFunc()
+	}
+
+	// Cache controller — monitors provider readiness and node topology.
+	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] {
+		cacheController := cache.NewController(kClient, mgr.GetEventRecorderFor("KAITO-Cache-controller"))
+		if err = cacheController.SetupWithManager(mgr); err != nil {
+			klog.ErrorS(err, "unable to create controller", "controller", "Cache")
+			exitWithErrorFunc()
+		}
 	}
 
 	if featuregates.FeatureGates[consts.FeatureFlagEnableInferenceSetController] {

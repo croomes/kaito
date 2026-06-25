@@ -27,29 +27,29 @@ pkgmodel "github.com/kaito-project/kaito/pkg/model"
 "github.com/kaito-project/kaito/pkg/utils/generator"
 )
 
-// tachyonTestProvider simulates the Tachyon provider for integration tests.
+// dacsTestProvider simulates the DACS provider for integration tests.
 // It returns mutations matching the CSI-based approach: labels + env vars only.
-type tachyonTestProvider struct {
+type dacsTestProvider struct {
 blobPrefix  string
 discoveryEP string
 kvEnabled   bool
 }
 
-func (p *tachyonTestProvider) Name() string { return "tachyon" }
-func (p *tachyonTestProvider) IsAvailable(_ context.Context) (bool, error) {
+func (p *dacsTestProvider) Name() string { return "dacs" }
+func (p *dacsTestProvider) IsAvailable(_ context.Context, _ string) (bool, error) {
 return true, nil
 }
-func (p *tachyonTestProvider) IsReady(_ context.Context) (bool, string, error) {
+func (p *dacsTestProvider) IsReady(_ context.Context, _ string) (bool, string, error) {
 return true, "ready", nil
 }
-func (p *tachyonTestProvider) PodMutations(_ context.Context, concern CacheConcern, ws *kaitov1beta1.Workspace, modelName, modelRevision string) (*PodMutations, error) {
+func (p *dacsTestProvider) PodMutations(_ context.Context, concern CacheConcern, ws *kaitov1beta1.Workspace, modelName, modelRevision, _ string) (*PodMutations, error) {
 mutations := &PodMutations{}
 
 switch concern {
 case CacheConcernModelWeights:
 // CSI approach: label triggers webhook injection.
 mutations.Labels = map[string]string{
-"tachyon.azure.com/inject": "true",
+"dacs.azure.com/inject": "true",
 }
 if modelName != "" {
 revision := modelRevision
@@ -69,18 +69,18 @@ return mutations, nil
 }
 // CSI approach: label triggers webhook injection for KV connector libs.
 mutations.Labels = map[string]string{
-"tachyon.azure.com/inject": "true",
+"dacs.azure.com/inject": "true",
 }
 mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
 Name:  "VLLM_KV_TRANSFER_CONFIG",
-Value: `{"kv_connector":"py_tachyon_client.connectors.vllm_connector.TachyonKVConnector","kv_connector_extra_config":{"locator_nodes":"` + p.discoveryEP + `","protocol":"tcp","initial_ttl_ms":300000,"producer_ttl_ms":1800000,"max_ttl_ms":86400000}}`,
+Value: `{"kv_connector":"py_dacs_client.connectors.vllm_connector.DacsKVConnector","kv_connector_extra_config":{"locator_nodes":"` + p.discoveryEP + `","protocol":"tcp","initial_ttl_ms":300000,"producer_ttl_ms":1800000,"max_ttl_ms":86400000}}`,
 })
 }
 
 return mutations, nil
 }
-func (p *tachyonTestProvider) Prewarm(_ context.Context, _ PrewarmRequest) error { return nil }
-func (p *tachyonTestProvider) Cleanup(_ context.Context, _ PrewarmRequest) error  { return nil }
+
+func (p *dacsTestProvider) Cleanup(_ context.Context, _ *kaitov1beta1.Workspace, _ string) error { return nil }
 
 // mockModel implements pkgmodel.Model for tests.
 type mockModel struct {
@@ -101,10 +101,10 @@ func (m *mockModel) GetTuningParameters() *pkgmodel.PresetParam { return nil }
 func (m *mockModel) SupportDistributedInference() bool          { return false }
 func (m *mockModel) SupportTuning() bool                        { return false }
 
-func setupTachyonProvider() *tachyonTestProvider {
-p := &tachyonTestProvider{
+func setupDacsProvider() *dacsTestProvider {
+p := &dacsTestProvider{
 blobPrefix:  "kaito-models",
-discoveryEP: "http://cacheserver-discovery.tachyon-cache-system.svc.cluster.local:9065",
+discoveryEP: "http://cacheserver-discovery.dacs-cache-system.svc.cluster.local:9065",
 kvEnabled:   true,
 }
 Register(p)
@@ -114,7 +114,7 @@ return p
 // TestSetCacheMutations_FullPipeline tests the complete mutation pipeline
 // from feature gate check through to pod spec modification.
 func TestSetCacheMutations_FullPipeline(t *testing.T) {
-setupTachyonProvider()
+setupDacsProvider()
 
 tests := []struct {
 name               string
@@ -128,8 +128,8 @@ name:               "feature gate disabled - no mutations",
 featureGateEnabled: false,
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeRequired,
 },
 },
@@ -141,8 +141,8 @@ name:               "model weights only - label + model path",
 featureGateEnabled: true,
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeOpportunistic,
 },
 },
@@ -155,8 +155,8 @@ name:               "KV cache only - KV config env var",
 featureGateEnabled: true,
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-KVCache: &kaitov1beta1.KVCacheConfig{
-Provider: "tachyon",
+KVCache: &kaitov1beta1.KVCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeRequired,
 },
 },
@@ -169,12 +169,12 @@ name:               "both model weights and KV cache",
 featureGateEnabled: true,
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeOpportunistic,
 },
-KVCache: &kaitov1beta1.KVCacheConfig{
-Provider: "tachyon",
+KVCache: &kaitov1beta1.KVCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeRequired,
 },
 },
@@ -187,8 +187,8 @@ name:               "disabled mode - no mutations",
 featureGateEnabled: true,
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeDisabled,
 },
 },
@@ -266,7 +266,7 @@ t.Error("existing env var EXISTING_VAR was lost or modified")
 // TestSetCacheMutations_ModelPathDerivation verifies that KAITO_MODEL_PATH
 // is correctly derived from the model name and blob prefix.
 func TestSetCacheMutations_ModelPathDerivation(t *testing.T) {
-setupTachyonProvider()
+setupDacsProvider()
 featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
@@ -296,8 +296,8 @@ for _, tt := range tests {
 t.Run(tt.name, func(t *testing.T) {
 ws := &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeOpportunistic,
 },
 },
@@ -340,14 +340,14 @@ t.Errorf("KAITO_MODEL_PATH: got %q, want %q", modelPath, tt.expectedPath)
 // TestSetCacheMutations_PreservesExistingPodSpec verifies that cache mutations
 // don't interfere with existing pod spec elements.
 func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
-setupTachyonProvider()
+setupDacsProvider()
 featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
 ws := &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeRequired,
 },
 },
@@ -430,7 +430,7 @@ t.Fatalf("expected 1 volume mount (only existing), got %d", len(spec.Containers[
 // TestSetCachePodTemplateLabels verifies that the StatefulSet modifier
 // correctly applies labels from cache mutations to the pod template.
 func TestSetCachePodTemplateLabels(t *testing.T) {
-setupTachyonProvider()
+setupDacsProvider()
 featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
@@ -443,8 +443,8 @@ expectLabel bool
 name: "model weights enabled - label added",
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeOpportunistic,
 },
 },
@@ -455,8 +455,8 @@ expectLabel: true,
 name: "KV cache enabled - label added",
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-KVCache: &kaitov1beta1.KVCacheConfig{
-Provider: "tachyon",
+KVCache: &kaitov1beta1.KVCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeRequired,
 },
 },
@@ -472,8 +472,8 @@ expectLabel: false,
 name: "disabled mode - no label",
 workspace: &kaitov1beta1.Workspace{
 Cache: &kaitov1beta1.CacheSpec{
-ModelWeights: &kaitov1beta1.ModelWeightsCacheConfig{
-Provider: "tachyon",
+ModelCache: &kaitov1beta1.ModelCacheSpec{
+Provider: "dacs",
 Mode:     kaitov1beta1.CacheModeDisabled,
 },
 },
@@ -497,12 +497,12 @@ Model:     &mockModel{name: "microsoft/phi-4"},
 if tt.workspace.Cache == nil {
 return
 }
-mutations, err := collectMutations(ctx.Ctx, tt.workspace, "microsoft/phi-4", "main")
+mutations, err := collectMutations(ctx.Ctx, nil, tt.workspace, "microsoft/phi-4", "main")
 if err != nil {
 t.Fatalf("unexpected error: %v", err)
 }
 
-hasLabel := mutations != nil && len(mutations.Labels) > 0 && mutations.Labels["tachyon.azure.com/inject"] == "true"
+hasLabel := mutations != nil && len(mutations.Labels) > 0 && mutations.Labels["dacs.azure.com/inject"] == "true"
 if hasLabel != tt.expectLabel {
 t.Errorf("label present: got %v, want %v", hasLabel, tt.expectLabel)
 }
@@ -517,7 +517,7 @@ Labels: map[string]string{"existing": "label"},
 }
 src := &PodMutations{
 Labels: map[string]string{
-"tachyon.azure.com/inject": "true",
+"dacs.azure.com/inject": "true",
 "another": "value",
 },
 }
@@ -530,7 +530,7 @@ t.Fatalf("expected 3 labels after merge, got %d", len(dst.Labels))
 if dst.Labels["existing"] != "label" {
 t.Error("existing label was lost")
 }
-if dst.Labels["tachyon.azure.com/inject"] != "true" {
+if dst.Labels["dacs.azure.com/inject"] != "true" {
 t.Error("inject label not merged")
 }
 if dst.Labels["another"] != "value" {
