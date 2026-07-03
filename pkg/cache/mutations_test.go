@@ -395,7 +395,7 @@ func TestApplyTemplateCacheMutations_AppliesLabelsAndEnvVars(t *testing.T) {
 		},
 	}
 
-	ApplyTemplateCacheMutations(context.Background(), ws, ss)
+	ApplyTemplateCacheMutations(context.Background(), ws, nil, ss)
 
 	if ss.Spec.Template.Labels["model-label"] != "enabled" {
 		t.Fatalf("expected label to be applied, got %v", ss.Spec.Template.Labels)
@@ -548,4 +548,48 @@ func (m *mockDefaultConfigProvider) Cleanup(_ context.Context, _ *kaitov1beta1.W
 }
 func (m *mockDefaultConfigProvider) DefaultConfig(concern string) map[string]string {
 	return m.defaults
+}
+
+// TestBuildRuntimeConfigMap_RewritesUnchanged documents P6: buildRuntimeConfigMap
+// performs no diff check. After creating the runtime ConfigMap it issues an
+// unconditional Update on every subsequent call, even when the merged data is
+// identical. The redundant write is detected via a bumped resourceVersion, so a
+// future diff-check optimization (or a regression removing it) is observable here.
+func TestBuildRuntimeConfigMap_RewritesUnchanged(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	userCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-cfg", Namespace: "default"},
+		Data:       map[string]string{"discoveryEndpoint": "ep.example"},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(userCM).Build()
+
+	ws := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{Name: "ws1", Namespace: "default"}}
+
+	name := buildRuntimeConfigMap(context.Background(), kubeClient, ws,
+		"user-cfg", kaitov1beta1.CacheProvider("dacs"), "model")
+	if name == "" {
+		t.Fatal("expected a runtime ConfigMap name")
+	}
+
+	key := client.ObjectKey{Namespace: "default", Name: name}
+	created := &corev1.ConfigMap{}
+	if err := kubeClient.Get(context.Background(), key, created); err != nil {
+		t.Fatalf("runtime ConfigMap not created: %v", err)
+	}
+	rvCreate := created.ResourceVersion
+
+	// Second identical call must still write (no diff check) → resourceVersion bumps.
+	if got := buildRuntimeConfigMap(context.Background(), kubeClient, ws,
+		"user-cfg", kaitov1beta1.CacheProvider("dacs"), "model"); got != name {
+		t.Fatalf("expected stable runtime CM name, got %q want %q", got, name)
+	}
+	updated := &corev1.ConfigMap{}
+	if err := kubeClient.Get(context.Background(), key, updated); err != nil {
+		t.Fatalf("runtime ConfigMap missing after update: %v", err)
+	}
+	if updated.ResourceVersion == rvCreate {
+		t.Errorf("expected an unconditional rewrite (bumped resourceVersion), got %q unchanged", rvCreate)
+	}
 }
