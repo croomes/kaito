@@ -382,12 +382,12 @@ func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.Works
 // ApplyTemplateCacheMutations applies cache mutations (labels, env vars, volumes)
 // to a StatefulSet generated from a custom pod template. This is the equivalent
 // of SetCacheMutations + SetCachePodTemplateLabels for the template inference path.
-func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, ss *appsv1.StatefulSet) {
+func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, kubeClient client.Client, ss *appsv1.StatefulSet) {
 	if ws.Cache == nil {
 		return
 	}
 
-	mutations, err := collectMutations(ctx, nil, ws, "", "")
+	mutations, err := collectMutations(ctx, kubeClient, ws, "", "")
 	if err != nil {
 		klog.V(2).InfoS("Failed to collect cache mutations for template inference", "error", err)
 		return
@@ -395,6 +395,9 @@ func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace
 	if mutations == nil {
 		return
 	}
+
+	// Mount user-provided Config ConfigMaps as volumes (parity with SetCacheMutations).
+	mountCacheConfigMaps(ctx, kubeClient, ws, mutations)
 
 	klog.InfoS("Cache mutations applied to template inference",
 		"workspace", ws.Name,

@@ -31,7 +31,7 @@ func CreateTemplateInference(ctx context.Context, workspaceObj *kaitov1beta1.Wor
 
 	// Apply cache mutations for template-based workspaces.
 	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] && workspaceObj.Cache != nil {
-		cache.ApplyTemplateCacheMutations(ctx, workspaceObj, depObj)
+		cache.ApplyTemplateCacheMutations(ctx, workspaceObj, kubeClient, depObj)
 	}
 
 	err := resources.CreateResource(ctx, client.Object(depObj), kubeClient)

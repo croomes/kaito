@@ -640,3 +640,92 @@ func TestExplicitRegistration(t *testing.T) {
 
 // Suppress unused import warning.
 var _ = metav1.Now
+
+// --- P4 / t12: multiple Cache CRs without a default must fail closed ---
+//
+// When neither a default cache (DefaultCacheName) nor an explicit cacheName is
+// resolvable and more than one Cache CR exists, both IsAvailable and IsReady must
+// surface a clear "multiple ... no default" error instead of silently picking one.
+
+func TestIsAvailable_MultipleCachesNoDefault(t *testing.T) {
+	p := newFakeProvider(newCache("cache-a"), newCache("cache-b"))
+	available, err := p.IsAvailable(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected an error when multiple caches exist without a default")
+	}
+	if available {
+		t.Error("expected not available when the default cache is ambiguous")
+	}
+	if !strings.Contains(err.Error(), "multiple DACS cache clusters") {
+		t.Fatalf("expected a multiple-cache error, got %v", err)
+	}
+}
+
+func TestIsReady_MultipleCachesNoDefault(t *testing.T) {
+	p := newFakeProvider(newCache("cache-a"), newCache("cache-b"))
+	ready, _, err := p.IsReady(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected an error when multiple caches exist without a default")
+	}
+	if ready {
+		t.Error("expected not ready when the default cache is ambiguous")
+	}
+	if !strings.Contains(err.Error(), "multiple DACS cache clusters") {
+		t.Fatalf("expected a multiple-cache error, got %v", err)
+	}
+}
+
+func TestIsReady_ExplicitCacheNameDisambiguatesMany(t *testing.T) {
+	p := newFakeProvider(newCache("cache-a"), newCache("cache-b"))
+	ready, reason, err := p.IsReady(context.Background(), "cache-b")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ready {
+		t.Errorf("expected ready for the explicitly named cache, got reason %q", reason)
+	}
+}
+
+// --- P1: bounded API-call volume per readiness check ---
+//
+// Every workspace reconcile calls the provider's readiness path, so the number of
+// API-server round trips per call is a scale-sensitive contract. These tests pin
+// the current call counts so a regression that adds unbounded Gets/Lists is caught.
+
+func newCountingClient(objs ...runtime.Object) (*dynamicfake.FakeDynamicClient, map[string]int) {
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{cacheGVR: "CacheList"}, objs...)
+	counts := map[string]int{}
+	client.PrependReactor("*", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		counts[action.GetVerb()]++
+		return false, nil, nil // not handled: fall through to the object tracker
+	})
+	return client, counts
+}
+
+func TestIsReady_APICallVolume(t *testing.T) {
+	cases := []struct {
+		name      string
+		objs      []runtime.Object
+		cacheName string
+		wantGet   int
+		wantList  int
+	}{
+		{"default present: one Get, no List", []runtime.Object{newReadyCache()}, "", 1, 0},
+		{"default absent, single cache: Get miss + one List", []runtime.Object{newCache("only")}, "", 1, 1},
+		{"explicit name: one Get, no List", []runtime.Object{newCache("my")}, "my", 1, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, counts := newCountingClient(tc.objs...)
+			p := New(client, DefaultConfig())
+			if _, _, err := p.IsReady(context.Background(), tc.cacheName); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if counts["get"] != tc.wantGet || counts["list"] != tc.wantList {
+				t.Fatalf("API calls: got get=%d list=%d, want get=%d list=%d",
+					counts["get"], counts["list"], tc.wantGet, tc.wantList)
+			}
+		})
+	}
+}
