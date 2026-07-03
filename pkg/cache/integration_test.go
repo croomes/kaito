@@ -30,7 +30,6 @@ import (
 // dacsTestProvider simulates the DACS provider for integration tests.
 // It returns mutations matching the CSI-based approach: labels + env vars only.
 type dacsTestProvider struct {
-	blobPrefix  string
 	discoveryEP string
 	kvEnabled   bool
 }
@@ -47,21 +46,14 @@ func (p *dacsTestProvider) PodMutations(_ context.Context, concern CacheConcern,
 
 	switch concern {
 	case CacheConcernModelWeights:
-		// CSI approach: label triggers webhook injection.
+		// Label triggers webhook injection + RunAI streamer env vars.
 		mutations.Labels = map[string]string{
 			"dacs.azure.com/inject": "true",
 		}
-		if modelName != "" {
-			revision := modelRevision
-			if revision == "" {
-				revision = "main"
-			}
-			localPath := "/mnt/models/" + p.blobPrefix + "/" + modelName + "/" + revision
-			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
-				Name:  "KAITO_MODEL_PATH",
-				Value: localPath,
-			})
-		}
+		mutations.EnvVars = append(mutations.EnvVars,
+			corev1.EnvVar{Name: "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", Value: "true"},
+			corev1.EnvVar{Name: "RUNAI_STREAMER_CACHE_ENABLED", Value: "true"},
+		)
 
 	case CacheConcernKVCache:
 		if !p.kvEnabled {
@@ -105,7 +97,6 @@ func (m *mockModel) SupportTuning() bool                        { return false }
 
 func setupDacsProvider() *dacsTestProvider {
 	p := &dacsTestProvider{
-		blobPrefix:  "kaito-models",
 		discoveryEP: "http://cacheserver-discovery.dacs-cache-system.svc.cluster.local:9065",
 		kvEnabled:   true,
 	}
@@ -136,10 +127,10 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 					},
 				},
 			},
-			expectNoEnvVars: []string{"KAITO_MODEL_PATH", "VLLM_KV_TRANSFER_CONFIG"},
+			expectNoEnvVars: []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", "VLLM_KV_TRANSFER_CONFIG"},
 		},
 		{
-			name:               "model weights only - label + model path",
+			name:               "model weights only - label + streamer env vars",
 			featureGateEnabled: true,
 			workspace: &kaitov1beta1.Workspace{
 				Cache: &kaitov1beta1.CacheSpec{
@@ -149,7 +140,7 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 					},
 				},
 			},
-			expectEnvVars:   []string{"KAITO_MODEL_PATH"},
+			expectEnvVars:   []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED"},
 			expectNoEnvVars: []string{"VLLM_KV_TRANSFER_CONFIG", "LD_PRELOAD", "SI_storagePath"},
 		},
 		{
@@ -164,7 +155,7 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 				},
 			},
 			expectEnvVars:   []string{"VLLM_KV_TRANSFER_CONFIG"},
-			expectNoEnvVars: []string{"KAITO_MODEL_PATH", "LD_PRELOAD"},
+			expectNoEnvVars: []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", "LD_PRELOAD"},
 		},
 		{
 			name:               "both model weights and KV cache",
@@ -181,7 +172,7 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 					},
 				},
 			},
-			expectEnvVars:   []string{"KAITO_MODEL_PATH", "VLLM_KV_TRANSFER_CONFIG"},
+			expectEnvVars:   []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", "VLLM_KV_TRANSFER_CONFIG"},
 			expectNoEnvVars: []string{"LD_PRELOAD", "SI_storagePath"},
 		},
 		{
@@ -195,13 +186,13 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 					},
 				},
 			},
-			expectNoEnvVars: []string{"KAITO_MODEL_PATH", "VLLM_KV_TRANSFER_CONFIG"},
+			expectNoEnvVars: []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", "VLLM_KV_TRANSFER_CONFIG"},
 		},
 		{
 			name:               "nil cache - no mutations",
 			featureGateEnabled: true,
 			workspace:          &kaitov1beta1.Workspace{},
-			expectNoEnvVars:    []string{"KAITO_MODEL_PATH", "VLLM_KV_TRANSFER_CONFIG"},
+			expectNoEnvVars:    []string{"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", "VLLM_KV_TRANSFER_CONFIG"},
 		},
 	}
 
@@ -265,77 +256,51 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 	}
 }
 
-// TestSetCacheMutations_ModelPathDerivation verifies that KAITO_MODEL_PATH
-// is correctly derived from the model name and blob prefix.
-func TestSetCacheMutations_ModelPathDerivation(t *testing.T) {
+// TestSetCacheMutations_RunAIStreamerEnvVars verifies that RunAI streamer
+// env vars are correctly injected for model weight caching.
+func TestSetCacheMutations_RunAIStreamerEnvVars(t *testing.T) {
 	setupDacsProvider()
 	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
-	tests := []struct {
-		name         string
-		presetName   string
-		expectedPath string
-	}{
-		{
-			name:         "standard org/model format",
-			presetName:   "microsoft/phi-4",
-			expectedPath: "/mnt/models/kaito-models/microsoft/phi-4/main",
+	ws := &kaitov1beta1.Workspace{
+		Cache: &kaitov1beta1.CacheSpec{
+			ModelCache: &kaitov1beta1.ModelCacheSpec{
+				Provider: "dacs",
+				Mode:     kaitov1beta1.CacheModeOpportunistic,
+			},
 		},
-		{
-			name:         "nested org name",
-			presetName:   "meta-llama/Llama-3.3-70B-Instruct",
-			expectedPath: "/mnt/models/kaito-models/meta-llama/Llama-3.3-70B-Instruct/main",
-		},
-		{
-			name:         "single segment model name",
-			presetName:   "phi-4",
-			expectedPath: "/mnt/models/kaito-models/phi-4/main",
+		Inference: &kaitov1beta1.InferenceSpec{
+			Preset: &kaitov1beta1.PresetSpec{
+				PresetMeta: kaitov1beta1.PresetMeta{Name: "microsoft/phi-4"},
+			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ws := &kaitov1beta1.Workspace{
-				Cache: &kaitov1beta1.CacheSpec{
-					ModelCache: &kaitov1beta1.ModelCacheSpec{
-						Provider: "dacs",
-						Mode:     kaitov1beta1.CacheModeOpportunistic,
-					},
-				},
-				Inference: &kaitov1beta1.InferenceSpec{
-					Preset: &kaitov1beta1.PresetSpec{
-						PresetMeta: kaitov1beta1.PresetMeta{Name: kaitov1beta1.ModelName(tt.presetName)},
-					},
-				},
-			}
+	ctx := &generator.WorkspaceGeneratorContext{
+		Ctx:       context.Background(),
+		Workspace: ws,
+		Model:     &mockModel{name: "microsoft/phi-4"},
+	}
+	spec := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "model"}},
+	}
 
-			ctx := &generator.WorkspaceGeneratorContext{
-				Ctx:       context.Background(),
-				Workspace: ws,
-				Model:     &mockModel{name: tt.presetName},
-			}
-			spec := &corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "model"}},
-			}
+	modifier := SetCacheMutations()
+	err := modifier(ctx, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-			modifier := SetCacheMutations()
-			err := modifier(ctx, spec)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			var modelPath string
-			for _, e := range spec.Containers[0].Env {
-				if e.Name == "KAITO_MODEL_PATH" {
-					modelPath = e.Value
-					break
-				}
-			}
-			if modelPath != tt.expectedPath {
-				t.Errorf("KAITO_MODEL_PATH: got %q, want %q", modelPath, tt.expectedPath)
-			}
-		})
+	envMap := map[string]string{}
+	for _, e := range spec.Containers[0].Env {
+		envMap[e.Name] = e.Value
+	}
+	if envMap["RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED"] != "true" {
+		t.Error("expected RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED=true")
+	}
+	if envMap["RUNAI_STREAMER_CACHE_ENABLED"] != "true" {
+		t.Error("expected RUNAI_STREAMER_CACHE_ENABLED=true")
 	}
 }
 
@@ -395,7 +360,7 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify existing init container is preserved (no new ones added with CSI).
+	// Verify existing init container is preserved.
 	if len(spec.InitContainers) != 1 {
 		t.Fatalf("expected 1 init container (only existing), got %d", len(spec.InitContainers))
 	}
@@ -403,7 +368,7 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 		t.Error("existing init container was not preserved")
 	}
 
-	// Verify existing volumes preserved (no new ones added with CSI).
+	// Verify existing volume preserved (fake provider doesn't add ImageVolume).
 	if len(spec.Volumes) != 1 {
 		t.Fatalf("expected 1 volume (only existing), got %d", len(spec.Volumes))
 	}
@@ -419,11 +384,11 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 	if envMap["CUDA_VISIBLE_DEVICES"] != "0,1" {
 		t.Error("CUDA_VISIBLE_DEVICES env var was lost")
 	}
-	if envMap["KAITO_MODEL_PATH"] == "" {
-		t.Error("KAITO_MODEL_PATH should be added")
+	if envMap["RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED"] != "true" {
+		t.Error("RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED should be added")
 	}
 
-	// Verify existing volume mounts preserved (no new ones added with CSI).
+	// Verify existing volume mounts preserved (fake provider doesn't add mounts).
 	if len(spec.Containers[0].VolumeMounts) != 1 {
 		t.Fatalf("expected 1 volume mount (only existing), got %d", len(spec.Containers[0].VolumeMounts))
 	}

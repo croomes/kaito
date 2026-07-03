@@ -157,10 +157,6 @@ func TestDefaultConfigProvider(t *testing.T) {
 		DiscoveryEndpoint:   "discovery.example",
 		KVCacheEnabled:      true,
 		KVConnectorProtocol: "rdma",
-		BlobEndpoint:        "https://blob.example",
-		BlobContainer:       "weights",
-		BlobPrefix:          "custom-prefix",
-		PrewarmImage:        "prewarm:latest",
 	}
 	p := New(newFakeProvider().client, cfg)
 
@@ -170,15 +166,6 @@ func TestDefaultConfigProvider(t *testing.T) {
 	}
 	if modelDefaults["discoveryEndpoint"] != cfg.DiscoveryEndpoint {
 		t.Fatalf("discoveryEndpoint: got %q, want %q", modelDefaults["discoveryEndpoint"], cfg.DiscoveryEndpoint)
-	}
-	if modelDefaults["blobEndpoint"] != cfg.BlobEndpoint {
-		t.Fatalf("blobEndpoint: got %q, want %q", modelDefaults["blobEndpoint"], cfg.BlobEndpoint)
-	}
-	if modelDefaults["blobContainer"] != cfg.BlobContainer {
-		t.Fatalf("blobContainer: got %q, want %q", modelDefaults["blobContainer"], cfg.BlobContainer)
-	}
-	if modelDefaults["blobPrefix"] != cfg.BlobPrefix {
-		t.Fatalf("blobPrefix: got %q, want %q", modelDefaults["blobPrefix"], cfg.BlobPrefix)
 	}
 
 	kvDefaults := p.DefaultConfig("kv")
@@ -197,10 +184,7 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("DACS_DISCOVERY_ENDPOINT", "env-discovery.example")
 	t.Setenv("DACS_KV_CACHE_ENABLED", "false")
 	t.Setenv("DACS_KV_CONNECTOR_PROTOCOL", "rdma")
-	t.Setenv("DACS_BLOB_ENDPOINT", "https://blob.env.example")
-	t.Setenv("DACS_BLOB_CONTAINER", "env-container")
-	t.Setenv("DACS_BLOB_PREFIX", "env-prefix")
-	t.Setenv("DACS_PREWARM_IMAGE", "env-prewarm:latest")
+	t.Setenv("DACS_KV_CONNECTOR_PROTOCOL", "rdma")
 
 	cfg := ConfigFromEnv()
 	if cfg.DiscoveryEndpoint != "env-discovery.example" {
@@ -211,18 +195,6 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if cfg.KVConnectorProtocol != "rdma" {
 		t.Fatalf("KVConnectorProtocol: got %q", cfg.KVConnectorProtocol)
-	}
-	if cfg.BlobEndpoint != "https://blob.env.example" {
-		t.Fatalf("BlobEndpoint: got %q", cfg.BlobEndpoint)
-	}
-	if cfg.BlobContainer != "env-container" {
-		t.Fatalf("BlobContainer: got %q", cfg.BlobContainer)
-	}
-	if cfg.BlobPrefix != "env-prefix" {
-		t.Fatalf("BlobPrefix: got %q", cfg.BlobPrefix)
-	}
-	if cfg.PrewarmImage != "env-prewarm:latest" {
-		t.Fatalf("PrewarmImage: got %q", cfg.PrewarmImage)
 	}
 }
 
@@ -250,15 +222,11 @@ func TestPodMutations_ModelWeights(t *testing.T) {
 		t.Errorf("label %s: got %q, want %q", InjectLabelKey, mutations.Labels[InjectLabelKey], InjectLabelValue)
 	}
 
-	// Should have KAITO_MODEL_PATH plus DACS discovery env vars.
-	if len(mutations.EnvVars) != 7 {
-		t.Fatalf("expected 7 env vars, got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
+	// Should have DACS discovery env vars (no KAITO_MODEL_PATH).
+	if len(mutations.EnvVars) != 6 {
+		t.Fatalf("expected 6 env vars, got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
 	}
 	envVars := envVarMap(mutations.EnvVars)
-	expectedPath := "/mnt/models/kaito-models/microsoft/phi-4/main"
-	if envVars["KAITO_MODEL_PATH"] != expectedPath {
-		t.Errorf("KAITO_MODEL_PATH: got %q, want %q", envVars["KAITO_MODEL_PATH"], expectedPath)
-	}
 	if envVars["RUNAI_STREAMER_CACHE_ENABLED"] != "true" {
 		t.Errorf("RUNAI_STREAMER_CACHE_ENABLED: got %q, want true", envVars["RUNAI_STREAMER_CACHE_ENABLED"])
 	}
@@ -288,7 +256,6 @@ func TestPodMutations_ModelWeightsCustomPrefix(t *testing.T) {
 			cacheGVR: "CacheList",
 		})
 	cfg := DefaultConfig()
-	cfg.BlobPrefix = "custom-prefix"
 	p := New(client, cfg)
 
 	ws := &kaitov1beta1.Workspace{
@@ -305,13 +272,8 @@ func TestPodMutations_ModelWeightsCustomPrefix(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(mutations.EnvVars) != 7 {
-		t.Fatalf("expected 7 env vars, got %d", len(mutations.EnvVars))
-	}
-	envVars := envVarMap(mutations.EnvVars)
-	expectedPath := "/mnt/models/custom-prefix/microsoft/phi-4/abc123"
-	if envVars["KAITO_MODEL_PATH"] != expectedPath {
-		t.Errorf("KAITO_MODEL_PATH: got %q, want %q", envVars["KAITO_MODEL_PATH"], expectedPath)
+	if len(mutations.EnvVars) != 6 {
+		t.Fatalf("expected 6 env vars, got %d", len(mutations.EnvVars))
 	}
 }
 
@@ -336,9 +298,9 @@ func TestPodMutations_ModelWeightsNoModelName(t *testing.T) {
 		t.Error("injection label should be set even without model name")
 	}
 
-	// No KAITO_MODEL_PATH when model name is empty.
+	// Same env vars regardless of model name (no KAITO_MODEL_PATH).
 	if len(mutations.EnvVars) != 6 {
-		t.Errorf("expected 6 env vars when model name empty, got %d", len(mutations.EnvVars))
+		t.Errorf("expected 6 env vars, got %d", len(mutations.EnvVars))
 	}
 }
 
@@ -410,13 +372,13 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 		},
 	}
 
-	// Model weights concern: label + KAITO_MODEL_PATH only.
+	// Model weights concern: label + RUNAI env vars only.
 	mwMutations, err := p.PodMutations(context.Background(), cache.CacheConcernModelWeights, ws, "microsoft/phi-4", "main", "")
 	if err != nil {
 		t.Fatalf("model weights: unexpected error: %v", err)
 	}
-	if len(mwMutations.EnvVars) != 7 {
-		t.Errorf("model weights should have KAITO_MODEL_PATH + RUNAI env vars, got %v", mwMutations.EnvVars)
+	if len(mwMutations.EnvVars) != 6 {
+		t.Errorf("model weights should have 6 RUNAI env vars, got %v", mwMutations.EnvVars)
 	}
 	for _, env := range mwMutations.EnvVars {
 		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
@@ -492,7 +454,7 @@ func TestPodMutations_ConcernIsolation(t *testing.T) {
 		t.Errorf("KV concern should not have init containers, got %d", len(kv.InitContainers))
 	}
 	for _, env := range kv.EnvVars {
-		if env.Name == "KAITO_MODEL_PATH" {
+		if env.Name == "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED" {
 			t.Errorf("KV concern should not include %s", env.Name)
 		}
 	}

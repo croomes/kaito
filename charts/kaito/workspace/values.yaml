@@ -197,14 +197,6 @@ cache:
   providers:
     dacs:
       enabled: false
-      discoveryEndpoint: "http://cacheserver-discovery.dacs-cache-system.svc.cluster.local:9065"
+      discoveryEndpoint: ""
       kvCacheEnabled: true
       kvConnectorProtocol: "tcp"
-      # Azure Blob Storage endpoint (used by prewarm Jobs).
-      blobEndpoint: ""
-      # Blob container for model weight storage.
-      blobContainer: "kaito-models"
-      # Path prefix within the blob container.
-      blobPrefix: "kaito-models"
-      # Container image used for prewarm Jobs (downloads from HF, uploads to cache).
-      prewarmImage: ""

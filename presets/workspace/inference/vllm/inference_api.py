@@ -88,13 +88,10 @@ class KAITOArgumentParser(argparse.ArgumentParser):
             type=int,
             help="Maximum number of steps to find the max available seq len fitting in the GPU memory.",
         )
-        # Default is applied after file-config merging in parse_args so the
-        # YAML config can still override an unspecified CLI value.
         self.add_argument(
             "--kaito-kv-cache-cpu-memory-utilization",
             type=float,
-            default=None,
-            help="KV cache CPU memory utilization. Defaults to 0.5 when neither this flag nor the kaito config file set it.",
+            help="KV cache CPU memory utilization.",
         )
 
     def _reset_vllm_defaults(self):
@@ -109,7 +106,7 @@ class KAITOArgumentParser(argparse.ArgumentParser):
 
         # See https://docs.vllm.ai/en/stable/serving/engine_args.html for more args
         engine_default_args = {
-            "model": os.environ.get("KAITO_MODEL_PATH", "/workspace/vllm/weights"),
+            "model": "/workspace/vllm/weights",
             "cpu_offload_gb": 0,
             "gpu_memory_utilization": get_max_gpu_memory_utilization(),
             "disable_log_stats": False,
@@ -135,11 +132,6 @@ class KAITOArgumentParser(argparse.ArgumentParser):
             for key, value in file_config.vllm.items():
                 runtime_args.append(f"--{key}")
                 runtime_args.append(str(value))
-
-        # Apply CLI default only after file-config merging so the YAML can
-        # override an unspecified CLI value.
-        if kaito_args.kaito_kv_cache_cpu_memory_utilization is None:
-            kaito_args.kaito_kv_cache_cpu_memory_utilization = 0.5
 
         vllm_args = self.vllm_parser.parse_args(runtime_args, **kwargs)
         # Merge KAITO and vLLM args
