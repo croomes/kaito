@@ -115,14 +115,10 @@ cache:
 When model weight caching is enabled, KAITO applies the following to inference pods:
 
 1. **Pod label** `dacs.azure.com/inject: "true"` — Triggers the DACS mutating webhook
-2. **KAITO_MODEL_PATH** env var — Set to the local path where the model appears (e.g., `/mnt/models/kaito-models/microsoft/phi-4/main`)
+2. **ImageVolume** with the DACS client library (`libStorageDirect.so`)
+3. **RunAI streamer env vars** — Enables the cache layer for model streaming from Azure Blob
 
-The DACS webhook (triggered by the label) injects:
-- `LD_PRELOAD` with `libStorageIntercept.so` (hostPath from CSI driver)
-- StorageIntercept configuration via a projected ConfigMap volume
-- Python client libraries (`PYTHONPATH`, `DACS_LIB_PATH`)
-
-The inference runtime (vLLM) reads from `KAITO_MODEL_PATH` as if it were a local filesystem. StorageIntercept transparently fetches data from the DACS cache (NVMe-backed) or falls through to blob storage on cache miss.
+The RunAI model streamer (used with `--load-format=runai_streamer`) fetches model weights from Azure Blob Storage (using `az://` model paths). With cache enabled, reads go through the DACS NVMe cache layer — cache hits are served from local NVMe, misses fall through to blob storage and are cached for subsequent requests.
 
 ### KV Cache Sharing
 

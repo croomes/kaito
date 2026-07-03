@@ -15,9 +15,9 @@
 // distributed NVMe cache service. It manages Cache CRs in the dacs-cache-system
 // namespace and configures inference pods for cache access via webhook-based injection.
 //
-// The DACS CSI driver + mutating webhook handles all library staging and pod injection.
-// KAITO's role is to: add the injection label, set KAITO_MODEL_PATH, and configure
-// the vLLM KV transfer config.
+// The DACS mutating webhook handles library injection when it sees the inject label.
+// KAITO's role is to: add the injection label, mount the client library image volume,
+// set RunAI streamer env vars for cache integration, and configure vLLM KV transfer.
 package dacs
 
 import (
@@ -59,7 +59,7 @@ const (
 	ClientLibPath      = ClientMountPath + "/usr/local/lib/python3.10/dist-packages/dacs_client/libStorageDirect.so"
 
 	// InjectLabelKey is the pod label that triggers the DACS mutating webhook
-	// to inject cache libraries, LD_PRELOAD, and StorageIntercept config.
+	// to inject cache libraries and configuration.
 	InjectLabelKey = "dacs.azure.com/inject"
 	// InjectLabelValue is the value that enables injection.
 	InjectLabelValue = "true"
@@ -85,29 +85,15 @@ type Config struct {
 
 	// KVConnectorProtocol is the transport protocol for KV cache (e.g., "rdma", "tcp").
 	KVConnectorProtocol string
-
-	// BlobEndpoint is the Azure Blob Storage endpoint (used by prewarm Jobs).
-	BlobEndpoint string
-
-	// BlobContainer is the blob container used for model weight storage (used by prewarm Jobs).
-	BlobContainer string
-
-	// BlobPrefix is the path prefix within the container (defaults to "kaito-models").
-	BlobPrefix string
-
-	// PrewarmImage is the container image used for prewarm Jobs.
-	PrewarmImage string
 }
 
 // DefaultConfig returns sensible defaults for DACS integration.
+// DiscoveryEndpoint is left empty to enable auto-discovery from the Cache CR.
 func DefaultConfig() Config {
 	return Config{
-		DiscoveryEndpoint:   DefaultDiscoveryEndpoint,
 		ClientImage:         DefaultClientImage,
 		KVCacheEnabled:      true,
 		KVConnectorProtocol: "tcp",
-		BlobContainer:       "kaito-models",
-		BlobPrefix:          DefaultBlobPrefix,
 	}
 }
 
@@ -238,9 +224,7 @@ func (p *Provider) DefaultConfig(concern string) map[string]string {
 	}
 	switch concern {
 	case "model":
-		defaults["blobEndpoint"] = p.config.BlobEndpoint
-		defaults["blobContainer"] = p.config.BlobContainer
-		defaults["blobPrefix"] = p.config.BlobPrefix
+		// No model-specific defaults needed (model path is user-specified via az:// in workspace YAML).
 	case "kv":
 		defaults["kvConnectorProtocol"] = p.config.KVConnectorProtocol
 	}
@@ -249,7 +233,8 @@ func (p *Provider) DefaultConfig(concern string) map[string]string {
 
 // PodMutations returns the pod-level changes needed for the requested cache concern.
 // cacheName identifies the target cache CR; if empty, uses the default (p.cacheObj).
-// For ModelWeights: adds the DACS injection label and sets KAITO_MODEL_PATH.
+// For ModelWeights: adds the DACS injection label, mounts the client library,
+// and sets RunAI streamer env vars to enable cache-backed model loading.
 // The DACS mutating webhook handles all library injection when it sees the label.
 // For KVCache: adds the injection label and the vLLM KV transfer config env var.
 func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern, workspace *kaitov1beta1.Workspace, modelName, modelRevision, cacheName string) (*cache.PodMutations, error) {
@@ -281,16 +266,6 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 			MountPath: ClientMountPath,
 			ReadOnly:  true,
 		})
-
-		// Set the model path that vLLM will use as --model.
-		// StorageIntercept (injected by webhook) intercepts reads under this path.
-		if modelName != "" {
-			localPath := ModelLocalPath(DefaultStoragePath, p.config.BlobPrefix, modelName, modelRevision)
-			mutations.EnvVars = append(mutations.EnvVars, corev1.EnvVar{
-				Name:  "KAITO_MODEL_PATH",
-				Value: localPath,
-			})
-		}
 
 		// Tell run:ai model streamer to load the cache library from the ImageVolume.
 		discoveryEndpoint := p.resolveDiscoveryEndpoint(cacheName)
@@ -418,18 +393,6 @@ func ConfigFromEnv() Config {
 	}
 	if v := os.Getenv("DACS_KV_CONNECTOR_PROTOCOL"); v != "" {
 		cfg.KVConnectorProtocol = v
-	}
-	if v := os.Getenv("DACS_BLOB_ENDPOINT"); v != "" {
-		cfg.BlobEndpoint = v
-	}
-	if v := os.Getenv("DACS_BLOB_CONTAINER"); v != "" {
-		cfg.BlobContainer = v
-	}
-	if v := os.Getenv("DACS_BLOB_PREFIX"); v != "" {
-		cfg.BlobPrefix = v
-	}
-	if v := os.Getenv("DACS_PREWARM_IMAGE"); v != "" {
-		cfg.PrewarmImage = v
 	}
 
 	return cfg

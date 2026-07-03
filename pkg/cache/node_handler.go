@@ -53,15 +53,11 @@ func (h *nodeEventHandler) Generic(_ context.Context, _ event.GenericEvent, _ wo
 
 // isNodeRelevant filters Node events to only those that might affect cache topology.
 func isNodeRelevant(obj client.Object) bool {
-	node, ok := obj.(*corev1.Node)
+	_, ok := obj.(*corev1.Node)
 	if !ok {
 		return false
 	}
-	// Trigger reconcile when a node becomes Ready or is removed.
-	for _, cond := range node.Status.Conditions {
-		if cond.Type == corev1.NodeReady {
-			return true
-		}
-	}
+	// Any node change (addition, removal, readiness transition) may affect
+	// cache server scheduling, so always trigger a reconcile.
 	return true
 }

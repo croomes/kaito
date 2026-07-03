@@ -219,7 +219,6 @@ func TestCollectMutations_BothConcernsMergeResults(t *testing.T) {
 	isolateProviderRegistry(t)
 
 	Register(&dacsTestProvider{
-		blobPrefix:  "kaito-models",
 		discoveryEP: "cache-sample-discovery.dacs-cache-system.svc.cluster.local",
 		kvEnabled:   true,
 	})
@@ -244,16 +243,16 @@ func TestCollectMutations_BothConcernsMergeResults(t *testing.T) {
 	if mutations.Labels["dacs.azure.com/inject"] != "true" {
 		t.Fatalf("expected DACS injection label, got %v", mutations.Labels)
 	}
-	if len(mutations.EnvVars) != 2 {
-		t.Fatalf("expected model and KV env vars, got %v", mutations.EnvVars)
+	if len(mutations.EnvVars) != 3 {
+		t.Fatalf("expected model weight + KV env vars (3 total), got %v", mutations.EnvVars)
 	}
 
 	envVars := map[string]string{}
 	for _, envVar := range mutations.EnvVars {
 		envVars[envVar.Name] = envVar.Value
 	}
-	if envVars["KAITO_MODEL_PATH"] != "/mnt/models/kaito-models/microsoft/phi-4/main" {
-		t.Fatalf("expected KAITO_MODEL_PATH to be set, got %q", envVars["KAITO_MODEL_PATH"])
+	if envVars["RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED"] != "true" {
+		t.Fatalf("expected RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED to be set, got %q", envVars["RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED"])
 	}
 	if _, ok := envVars["VLLM_KV_TRANSFER_CONFIG"]; !ok {
 		t.Fatalf("expected VLLM_KV_TRANSFER_CONFIG to be set, got %v", envVars)

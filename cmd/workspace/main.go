@@ -208,7 +208,7 @@ func main() {
 
 	// Register cache providers based on feature gates and configuration.
 	cache.Register(cachenoop.NewProvider())
-	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] {
+	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] && os.Getenv("DACS_ENABLED") == "true" {
 		dynamicClient, dynErr := dynamic.NewForConfig(cfg)
 		if dynErr != nil {
 			klog.ErrorS(dynErr, "unable to create dynamic client for cache providers")
