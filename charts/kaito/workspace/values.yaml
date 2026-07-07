@@ -200,3 +200,4 @@ cache:
       discoveryEndpoint: ""
       kvCacheEnabled: true
       kvConnectorProtocol: "tcp"
+      clientImage: ""

@@ -88,6 +88,8 @@ spec:
               value: {{ .Values.cache.providers.dacs.kvCacheEnabled | quote }}
             - name: DACS_KV_CONNECTOR_PROTOCOL
               value: {{ .Values.cache.providers.dacs.kvConnectorProtocol | quote }}
+            - name: DACS_CLIENT_IMAGE
+              value: {{ .Values.cache.providers.dacs.clientImage | quote }}
             {{- end }}
           ports:
             - name: http-metrics

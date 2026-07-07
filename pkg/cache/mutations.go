@@ -179,7 +179,7 @@ func mergeMutations(dst, src *PodMutations) {
 		}
 	}
 
-	// Deduplicate env vars by name (last wins).
+	// Deduplicate env vars by name (first wins — user/dst values take priority).
 	existingEnvs := make(map[string]struct{}, len(dst.EnvVars))
 	for _, e := range dst.EnvVars {
 		existingEnvs[e.Name] = struct{}{}
@@ -197,18 +197,61 @@ func mergeMutations(dst, src *PodMutations) {
 }
 
 // applyMutations injects the collected mutations into the pod spec.
+// It deduplicates by name to avoid invalid PodSpecs with duplicate entries.
 func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 	if mutations == nil || len(spec.Containers) == 0 {
 		return
 	}
 
-	// Inject env vars and volume mounts into the first (model) container.
-	spec.Containers[0].Env = append(spec.Containers[0].Env, mutations.EnvVars...)
-	spec.Containers[0].VolumeMounts = append(spec.Containers[0].VolumeMounts, mutations.VolumeMounts...)
+	container := &spec.Containers[0]
 
-	// Inject volumes and init containers at the pod level.
-	spec.Volumes = append(spec.Volumes, mutations.Volumes...)
-	spec.InitContainers = append(spec.InitContainers, mutations.InitContainers...)
+	// Deduplicate env vars (first wins — existing user values take priority).
+	existingEnvs := make(map[string]struct{}, len(container.Env))
+	for _, e := range container.Env {
+		existingEnvs[e.Name] = struct{}{}
+	}
+	for _, e := range mutations.EnvVars {
+		if _, exists := existingEnvs[e.Name]; !exists {
+			container.Env = append(container.Env, e)
+			existingEnvs[e.Name] = struct{}{}
+		}
+	}
+
+	// Deduplicate volume mounts by name (first wins).
+	existingMounts := make(map[string]struct{}, len(container.VolumeMounts))
+	for _, m := range container.VolumeMounts {
+		existingMounts[m.Name] = struct{}{}
+	}
+	for _, m := range mutations.VolumeMounts {
+		if _, exists := existingMounts[m.Name]; !exists {
+			container.VolumeMounts = append(container.VolumeMounts, m)
+			existingMounts[m.Name] = struct{}{}
+		}
+	}
+
+	// Deduplicate volumes by name (first wins).
+	existingVols := make(map[string]struct{}, len(spec.Volumes))
+	for _, v := range spec.Volumes {
+		existingVols[v.Name] = struct{}{}
+	}
+	for _, v := range mutations.Volumes {
+		if _, exists := existingVols[v.Name]; !exists {
+			spec.Volumes = append(spec.Volumes, v)
+			existingVols[v.Name] = struct{}{}
+		}
+	}
+
+	// Deduplicate init containers by name (first wins).
+	existingInits := make(map[string]struct{}, len(spec.InitContainers))
+	for _, c := range spec.InitContainers {
+		existingInits[c.Name] = struct{}{}
+	}
+	for _, c := range mutations.InitContainers {
+		if _, exists := existingInits[c.Name]; !exists {
+			spec.InitContainers = append(spec.InitContainers, c)
+			existingInits[c.Name] = struct{}{}
+		}
+	}
 }
 
 // mountCacheConfigMaps merges user-provided Config ConfigMaps with provider Helm
@@ -315,11 +358,13 @@ func buildRuntimeConfigMap(ctx context.Context, kubeClient client.Client,
 			return ""
 		}
 	} else {
-		// Update
-		existing.Data = merged
-		if err := kubeClient.Update(ctx, existing); err != nil {
-			klog.V(2).InfoS("Failed to update runtime cache ConfigMap", "name", runtimeName, "error", err)
-			return ""
+		// Update only if data changed.
+		if !mapsEqual(existing.Data, merged) {
+			existing.Data = merged
+			if err := kubeClient.Update(ctx, existing); err != nil {
+				klog.V(2).InfoS("Failed to update runtime cache ConfigMap", "name", runtimeName, "error", err)
+				return ""
+			}
 		}
 	}
 
@@ -382,18 +427,23 @@ func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.Works
 // ApplyTemplateCacheMutations applies cache mutations (labels, env vars, volumes)
 // to a StatefulSet generated from a custom pod template. This is the equivalent
 // of SetCacheMutations + SetCachePodTemplateLabels for the template inference path.
-func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, kubeClient client.Client, ss *appsv1.StatefulSet) {
+// Returns an error when cache mode is Required and mutations cannot be collected.
+func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, kubeClient client.Client, ss *appsv1.StatefulSet) error {
 	if ws.Cache == nil {
-		return
+		return nil
 	}
 
 	mutations, err := collectMutations(ctx, kubeClient, ws, "", "")
 	if err != nil {
 		klog.V(2).InfoS("Failed to collect cache mutations for template inference", "error", err)
-		return
+		// If cache mode is Required, propagate the error so the workspace blocks.
+		if ws.Cache.ModelCache != nil && ws.Cache.ModelCache.Mode == kaitov1beta1.CacheModeRequired {
+			return fmt.Errorf("cache mutations failed in Required mode: %w", err)
+		}
+		return nil
 	}
 	if mutations == nil {
-		return
+		return nil
 	}
 
 	// Mount user-provided Config ConfigMaps as volumes (parity with SetCacheMutations).
@@ -421,6 +471,7 @@ func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace
 
 	// Apply env vars, volumes, and mounts to the pod spec.
 	applyMutations(&ss.Spec.Template.Spec, mutations)
+	return nil
 }
 
 // extractCacheName reads the user-provided Config ConfigMap and returns the
@@ -437,4 +488,17 @@ func extractCacheName(ctx context.Context, kubeClient client.Client, namespace, 
 		return ""
 	}
 	return cm.Data["cacheName"]
+}
+
+// mapsEqual returns true if two string maps have identical keys and values.
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }

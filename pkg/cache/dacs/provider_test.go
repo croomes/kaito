@@ -38,7 +38,9 @@ func newFakeProvider(objects ...runtime.Object) *Provider {
 		map[schema.GroupVersionResource]string{
 			cacheGVR: "CacheList",
 		}, objects...)
-	return New(client, DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.ClientImage = "test.azurecr.io/dacs-client:latest"
+	return New(client, cfg)
 }
 
 func newReadyCache() *unstructured.Unstructured {
@@ -256,6 +258,7 @@ func TestPodMutations_ModelWeightsCustomPrefix(t *testing.T) {
 			cacheGVR: "CacheList",
 		})
 	cfg := DefaultConfig()
+	cfg.ClientImage = "test-registry/dacs-client:latest"
 	p := New(client, cfg)
 
 	ws := &kaitov1beta1.Workspace{

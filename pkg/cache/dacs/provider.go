@@ -52,11 +52,9 @@ const (
 	DefaultDiscoveryEndpoint = DefaultCacheName + "-discovery." + CacheNamespace + ".svc.cluster.local"
 	DefaultDiscoveryPort     = 9065
 
-	// ImageVolume configuration for the cache client sidecar libraries.
-	DefaultClientImage = "hariazstortest.azurecr.io/dacs-client:20260701.7"
-	ClientVolumeName   = "cache-client"
-	ClientMountPath    = "/opt/cache-client"
-	ClientLibPath      = ClientMountPath + "/usr/local/lib/python3.10/dist-packages/dacs_client/libStorageDirect.so"
+	ClientVolumeName = "cache-client"
+	ClientMountPath  = "/opt/cache-client"
+	ClientLibPath    = ClientMountPath + "/usr/local/lib/python3.10/dist-packages/dacs_client/libStorageDirect.so"
 
 	// InjectLabelKey is the pod label that triggers the DACS mutating webhook
 	// to inject cache libraries and configuration.
@@ -91,7 +89,7 @@ type Config struct {
 // DiscoveryEndpoint is left empty to enable auto-discovery from the Cache CR.
 func DefaultConfig() Config {
 	return Config{
-		ClientImage:         DefaultClientImage,
+		ClientImage:         os.Getenv("DACS_CLIENT_IMAGE"),
 		KVCacheEnabled:      true,
 		KVConnectorProtocol: "tcp",
 	}
@@ -250,7 +248,7 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 		// Mount the DACS client image as an ImageVolume.
 		clientImage := p.config.ClientImage
 		if clientImage == "" {
-			clientImage = DefaultClientImage
+			return nil, fmt.Errorf("DACS client image not configured: set cache.providers.dacs.clientImage in Helm values or DACS_CLIENT_IMAGE env var")
 		}
 		mutations.Volumes = append(mutations.Volumes, corev1.Volume{
 			Name: ClientVolumeName,
@@ -393,6 +391,9 @@ func ConfigFromEnv() Config {
 	}
 	if v := os.Getenv("DACS_KV_CONNECTOR_PROTOCOL"); v != "" {
 		cfg.KVConnectorProtocol = v
+	}
+	if v := os.Getenv("DACS_CLIENT_IMAGE"); v != "" {
+		cfg.ClientImage = v
 	}
 
 	return cfg

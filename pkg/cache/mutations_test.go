@@ -550,12 +550,10 @@ func (m *mockDefaultConfigProvider) DefaultConfig(concern string) map[string]str
 	return m.defaults
 }
 
-// TestBuildRuntimeConfigMap_RewritesUnchanged documents P6: buildRuntimeConfigMap
-// performs no diff check. After creating the runtime ConfigMap it issues an
-// unconditional Update on every subsequent call, even when the merged data is
-// identical. The redundant write is detected via a bumped resourceVersion, so a
-// future diff-check optimization (or a regression removing it) is observable here.
-func TestBuildRuntimeConfigMap_RewritesUnchanged(t *testing.T) {
+// TestBuildRuntimeConfigMap_SkipsUnchanged verifies that buildRuntimeConfigMap
+// does NOT update the runtime ConfigMap when the merged data is unchanged,
+// avoiding unnecessary API writes and watch-triggered reconciles.
+func TestBuildRuntimeConfigMap_SkipsUnchanged(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 
@@ -580,7 +578,7 @@ func TestBuildRuntimeConfigMap_RewritesUnchanged(t *testing.T) {
 	}
 	rvCreate := created.ResourceVersion
 
-	// Second identical call must still write (no diff check) → resourceVersion bumps.
+	// Second identical call must NOT write (data unchanged) → resourceVersion stays the same.
 	if got := buildRuntimeConfigMap(context.Background(), kubeClient, ws,
 		"user-cfg", kaitov1beta1.CacheProvider("dacs"), "model"); got != name {
 		t.Fatalf("expected stable runtime CM name, got %q want %q", got, name)
@@ -589,7 +587,7 @@ func TestBuildRuntimeConfigMap_RewritesUnchanged(t *testing.T) {
 	if err := kubeClient.Get(context.Background(), key, updated); err != nil {
 		t.Fatalf("runtime ConfigMap missing after update: %v", err)
 	}
-	if updated.ResourceVersion == rvCreate {
-		t.Errorf("expected an unconditional rewrite (bumped resourceVersion), got %q unchanged", rvCreate)
+	if updated.ResourceVersion != rvCreate {
+		t.Errorf("expected no update (same resourceVersion), got %q want %q", updated.ResourceVersion, rvCreate)
 	}
 }

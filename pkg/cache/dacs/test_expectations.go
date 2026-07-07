@@ -31,7 +31,11 @@ func init() {
 		Provider: kaitov1beta1.CacheProvider(ProviderName),
 		// PodMutations does not touch the API server, so a nil client is safe for
 		// offline mutation conformance.
-		NewForConformance: func() cache.Provider { return New(nil, DefaultConfig()) },
+		NewForConformance: func() cache.Provider {
+			cfg := DefaultConfig()
+			cfg.ClientImage = "test.azurecr.io/dacs-client:latest"
+			return New(nil, cfg)
+		},
 		// E2EExempt defaults to false, so dacs is exercised by the online e2e suite.
 		ModelWeights: cache.MutationExpectation{
 			Supported: true,
