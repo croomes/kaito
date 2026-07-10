@@ -51,22 +51,10 @@ const (
 // provider package is imported.
 func dacsE2EScenarios() []cache.E2EScenario {
 	return []cache.E2EScenario{
-		// t6/t11: Required mode with an unresolvable cache name must block the
-		// workload and surface a clear not-ready reason.
-		{
-			Name:       "Required mode blocks and reports a clear reason when the named cache is missing",
-			Capability: cache.E2ECapabilityControlPlane,
-			Run:        scenarioRequiredMissingCacheBlocks,
-		},
-		// t6: Opportunistic mode with an unresolvable cache name must proceed
-		// (StatefulSet created) without cache injection.
-		{
-			Name:       "Opportunistic mode proceeds without injection when the named cache is missing",
-			Capability: cache.E2ECapabilityControlPlane,
-			Run:        scenarioOpportunisticMissingCacheProceeds,
-		},
 		// t5: an explicit cacheName in the Config ConfigMap is honored for
 		// availability — a bad name suppresses injection, the real name enables it.
+		// This is DACS-specific because it exercises the DACS cacheName discovery
+		// mechanism (resolveDiscoveryEndpoint from a Cache CR).
 		{
 			Name:       "cacheName override in the Config ConfigMap is honored",
 			Capability: cache.E2ECapabilityControlPlane,
@@ -74,7 +62,8 @@ func dacsE2EScenarios() []cache.E2EScenario {
 		},
 		// t28: a pre-existing LD_LIBRARY_PATH on the model container is retained in
 		// the env list; the provider appends its own cache-lib path as a separate
-		// entry (it does not merge them).
+		// entry (it does not merge them). DACS-specific because it validates the
+		// DACS client library path injection behavior.
 		{
 			Name:       "pre-existing LD_LIBRARY_PATH is retained alongside the injected cache libs",
 			Capability: cache.E2ECapabilityControlPlane,
@@ -84,7 +73,7 @@ func dacsE2EScenarios() []cache.E2EScenario {
 		// --- Gated scenarios (skipped unless opted-in) ---
 
 		// t27: a bad client ImageVolume must fail the pod clearly and must NOT
-		// flip the cache condition to Ready. Needs a scheduled pod → data-plane.
+		// flip the cache condition to Ready. DACS-specific (ImageVolume mechanism).
 		{
 			Name:       "bad client ImageVolume fails the pod without marking the cache ready",
 			Capability: cache.E2ECapabilityDataPlane,
@@ -109,104 +98,10 @@ func dacsE2EScenarios() []cache.E2EScenario {
 			Capability: cache.E2ECapabilityDataPlane,
 			Run:        scenarioBlobFallback,
 		},
-		// t10: deleting the cache CR under a running workspace transitions the
-		// condition (and blocks a Required workspace). Mutates shared backend.
-		{
-			Name:       "cache CR deletion transitions the workspace cache condition",
-			Capability: cache.E2ECapabilityDisruptive,
-			Run:        scenarioCacheCRDeletion,
-		},
-		// t4/t14: backend scale down/up (node events) drive Ready/NotReady events.
-		{
-			Name:       "cache backend scale down/up emits Ready/NotReady transitions",
-			Capability: cache.E2ECapabilityDisruptive,
-			Run:        scenarioBackendScaleTransitions,
-		},
 	}
 }
 
 // ---- control-plane scenarios ----
-
-func scenarioRequiredMissingCacheBlocks(h cache.E2EHarness) error {
-	cm, err := createCacheNameConfigMap(h, "dacs-badname-req", nonExistentCacheName)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = h.Client().Delete(h.Ctx(), cm) }()
-
-	ws := h.NewCacheWorkspace("dacs-req-missing", kaitov1beta1.CacheSpec{
-		ModelCache: &kaitov1beta1.ModelCacheSpec{
-			Provider: kaitov1beta1.CacheProvider(ProviderName),
-			Mode:     kaitov1beta1.CacheModeRequired,
-			Config:   cm.Name,
-		},
-	})
-	if err := h.Client().Create(h.Ctx(), ws); err != nil {
-		return fmt.Errorf("creating workspace: %w", err)
-	}
-	defer func() { _ = h.Client().Delete(h.Ctx(), ws) }()
-
-	// The ModelCacheReady condition must go False with a non-empty reason, and no
-	// StatefulSet should be created while the cache is required-but-missing.
-	if err := h.Poll(3*time.Minute, func() error {
-		cond, found, err := cache.GetWorkspaceCondition(h, ws, modelCacheReadyCond)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("ModelCacheReady condition not set yet")
-		}
-		if cond.Status != metav1.ConditionFalse {
-			return fmt.Errorf("ModelCacheReady = %q, want False (reason=%q msg=%q)", cond.Status, cond.Reason, cond.Message)
-		}
-		if cond.Reason == "" {
-			return fmt.Errorf("ModelCacheReady is False but reason is empty")
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// StatefulSet must NOT exist yet (workload blocked).
-	if _, err := cache.GetStatefulSet(h, ws); err == nil {
-		return fmt.Errorf("StatefulSet was created despite Required cache being unavailable")
-	}
-	h.Logf("Required+missing cache correctly blocked workload with a clear reason")
-	return nil
-}
-
-func scenarioOpportunisticMissingCacheProceeds(h cache.E2EHarness) error {
-	cm, err := createCacheNameConfigMap(h, "dacs-badname-opp", nonExistentCacheName)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = h.Client().Delete(h.Ctx(), cm) }()
-
-	ws := h.NewCacheWorkspace("dacs-opp-missing", kaitov1beta1.CacheSpec{
-		ModelCache: &kaitov1beta1.ModelCacheSpec{
-			Provider: kaitov1beta1.CacheProvider(ProviderName),
-			Mode:     kaitov1beta1.CacheModeOpportunistic,
-			Config:   cm.Name,
-		},
-	})
-	if err := h.Client().Create(h.Ctx(), ws); err != nil {
-		return fmt.Errorf("creating workspace: %w", err)
-	}
-	defer func() { _ = h.Client().Delete(h.Ctx(), ws) }()
-
-	// Workload must proceed: the StatefulSet is created even though the cache is
-	// unavailable, and it must NOT carry the DACS injection label (no injection).
-	return h.Poll(5*time.Minute, func() error {
-		sts, err := cache.GetStatefulSet(h, ws)
-		if err != nil {
-			return fmt.Errorf("StatefulSet not created yet (Opportunistic should proceed): %w", err)
-		}
-		if v, ok := sts.Spec.Template.Labels[InjectLabelKey]; ok && v == InjectLabelValue {
-			return fmt.Errorf("injection label present despite unavailable cache in Opportunistic mode")
-		}
-		return nil
-	})
-}
 
 func scenarioCacheNameOverrideHonored(h cache.E2EHarness) error {
 	// An explicit cacheName provided through the Config ConfigMap must be honored:
@@ -373,20 +268,6 @@ func scenarioPerfThreshold(h cache.E2EHarness) error {
 
 func scenarioBlobFallback(h cache.E2EHarness) error {
 	return runServingWorkspace(h, "dacs-blobfb", func(ws *kaitov1beta1.Workspace) error { return nil })
-}
-
-func scenarioCacheCRDeletion(h cache.E2EHarness) error {
-	// Disruptive: intentionally left to operate only when opted-in. Validates that
-	// deleting the cache CR under a Required workspace transitions the condition to
-	// NotReady. Implemented against a dedicated (non-default) CR to avoid disturbing
-	// the shared cache-sample backend; requires a backend the operator can recreate.
-	return fmt.Errorf("scenario requires a dedicated DACS cache CR the operator can safely delete/recreate; " +
-		"enable and provide DACS_E2E_DEDICATED_CACHE to run")
-}
-
-func scenarioBackendScaleTransitions(h cache.E2EHarness) error {
-	return fmt.Errorf("scenario requires scaling the DACS cache backend nodes; " +
-		"enable and provide DACS_E2E_SCALABLE_BACKEND to run within the node budget")
 }
 
 // ---- helpers ----

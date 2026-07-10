@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -60,6 +61,30 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 		if utils.GetEnv("TEST_CACHE_ENABLED") != "true" {
 			Skip("Cache integration tests disabled (set TEST_CACHE_ENABLED=true)")
 		}
+		if utils.GetEnv("DACS_CACHE_VLLM_IMAGE") == "" {
+			Skip("DACS_CACHE_VLLM_IMAGE not set; skipping cache integration tests")
+		}
+		if utils.GetEnv("DACS_CACHE_MODEL_URL") == "" {
+			Skip("DACS_CACHE_MODEL_URL not set; skipping cache integration tests")
+		}
+		if utils.GetEnv("DACS_CACHE_STORAGE_ACCOUNT") == "" {
+			Skip("DACS_CACHE_STORAGE_ACCOUNT not set; skipping cache integration tests")
+		}
+		// Ensure the vllm-sa ServiceAccount exists in the test namespace so
+		// StatefulSet pods can be created. When AZURE_CLIENT_ID is set the SA
+		// is annotated for workload identity so the pod receives a token.
+		sa := &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vllm-sa",
+				Namespace: namespaceName,
+			},
+		}
+		if clientID := utils.GetEnv("AZURE_CLIENT_ID"); clientID != "" {
+			sa.Annotations = map[string]string{
+				"azure.workload.identity/client-id": clientID,
+			}
+		}
+		_ = utils.TestingCluster.KubeClient.Create(ctx, sa) // ignore AlreadyExists
 	})
 
 	// Iterate every provider discovered from the conformance registry so new
@@ -181,6 +206,226 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 					cleanupWorkspace(workspaceObj)
 					workspaceObj = nil
 				}
+			})
+		})
+
+		// Required mode with unavailable cache blocks workload creation.
+		Context(fmt.Sprintf("Provider %q: Required mode blocks workload when cache is unavailable", provider), func() {
+			var workspaceObj *kaitov1beta1.Workspace
+			var badConfigCM *corev1.ConfigMap
+
+			It("should set ModelCacheReady=False and not create a StatefulSet", func() {
+				if !exp.ModelWeights.Supported {
+					Skip(fmt.Sprintf("provider %q does not support the model weights concern", provider))
+				}
+				if len(exp.ModelWeights.RequiredLabels) == 0 && len(exp.ModelWeights.RequiredEnvVars) == 0 {
+					Skip(fmt.Sprintf("provider %q has no injection artifacts; unavailability cannot be tested", provider))
+				}
+				uniqueID := fmt.Sprint("cache-req-block-", rand.Intn(10000))
+
+				By("Creating a ConfigMap with a nonexistent cacheName to make the provider report unavailable")
+				badConfigCM = &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      uniqueID + "-badcfg",
+						Namespace: namespaceName,
+					},
+					Data: map[string]string{"cacheName": "nonexistent-cache-cr-e2e"},
+				}
+				Expect(utils.TestingCluster.KubeClient.Create(ctx, badConfigCM)).To(Succeed())
+
+				By("Creating a workspace with Required mode referencing the bad config")
+				workspaceObj = generateCacheWorkspace(uniqueID, namespaceName, provider, kaitov1beta1.CacheSpec{
+					ModelCache: &kaitov1beta1.ModelCacheSpec{
+						Provider: provider,
+						Mode:     kaitov1beta1.CacheModeRequired,
+						Config:   badConfigCM.Name,
+					},
+				})
+				Eventually(func() error {
+					return utils.TestingCluster.KubeClient.Create(ctx, workspaceObj, &client.CreateOptions{})
+				}, utils.PollTimeout, utils.PollInterval).Should(Succeed())
+
+				By("Verifying ModelCacheReady condition is False with a clear reason")
+				Eventually(func(g Gomega) {
+					err := utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, workspaceObj)
+					g.Expect(err).NotTo(HaveOccurred())
+					cond, found := lo.Find(workspaceObj.Status.Conditions, func(c metav1.Condition) bool {
+						return c.Type == string(kaitov1beta1.WorkspaceConditionTypeModelCacheReady)
+					})
+					g.Expect(found).To(BeTrue(), "ModelCacheReady condition not set")
+					g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+					g.Expect(cond.Reason).NotTo(BeEmpty(), "reason must explain why cache is unavailable")
+				}, 3*time.Minute, utils.PollInterval).Should(Succeed())
+
+				By("Verifying no StatefulSet is created (workload blocked)")
+				Consistently(func() bool {
+					sts := &appsv1.StatefulSet{}
+					err := utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, sts)
+					return err != nil // should remain not-found
+				}, 30*time.Second, 5*time.Second).Should(BeTrue(),
+					"StatefulSet should not be created when Required cache is unavailable")
+			})
+
+			AfterEach(func() {
+				if workspaceObj != nil {
+					cleanupWorkspace(workspaceObj)
+					workspaceObj = nil
+				}
+				if badConfigCM != nil {
+					_ = utils.TestingCluster.KubeClient.Delete(ctx, badConfigCM)
+					badConfigCM = nil
+				}
+			})
+		})
+
+		// Opportunistic mode with unavailable cache proceeds without injection.
+		Context(fmt.Sprintf("Provider %q: Opportunistic mode proceeds when cache is unavailable", provider), func() {
+			var workspaceObj *kaitov1beta1.Workspace
+			var badConfigCM *corev1.ConfigMap
+
+			It("should create StatefulSet without cache injection labels", func() {
+				if !exp.ModelWeights.Supported {
+					Skip(fmt.Sprintf("provider %q does not support the model weights concern", provider))
+				}
+				if len(exp.ModelWeights.RequiredLabels) == 0 && len(exp.ModelWeights.RequiredEnvVars) == 0 {
+					Skip(fmt.Sprintf("provider %q has no injection artifacts; unavailability cannot be tested", provider))
+				}
+				uniqueID := fmt.Sprint("cache-opp-proceed-", rand.Intn(10000))
+
+				By("Creating a ConfigMap with a nonexistent cacheName to make the provider report unavailable")
+				badConfigCM = &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      uniqueID + "-badcfg",
+						Namespace: namespaceName,
+					},
+					Data: map[string]string{"cacheName": "nonexistent-cache-cr-e2e"},
+				}
+				Expect(utils.TestingCluster.KubeClient.Create(ctx, badConfigCM)).To(Succeed())
+
+				By("Creating a workspace with Opportunistic mode referencing the bad config")
+				workspaceObj = generateCacheWorkspace(uniqueID, namespaceName, provider, kaitov1beta1.CacheSpec{
+					ModelCache: &kaitov1beta1.ModelCacheSpec{
+						Provider: provider,
+						Mode:     kaitov1beta1.CacheModeOpportunistic,
+						Config:   badConfigCM.Name,
+					},
+				})
+				createAndValidateWorkspace(workspaceObj)
+
+				By("Verifying StatefulSet exists but does NOT carry the provider's injection labels")
+				me := exp.ForConcern(cache.CacheConcernModelWeights)
+				Eventually(func() error {
+					sts := &appsv1.StatefulSet{}
+					if err := utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, sts); err != nil {
+						return err
+					}
+					for k, v := range me.RequiredLabels {
+						if actual, ok := sts.Spec.Template.Labels[k]; ok && actual == v {
+							return fmt.Errorf("injection label %s=%s present despite unavailable cache", k, v)
+						}
+					}
+					return nil
+				}, 10*time.Minute, utils.PollInterval).Should(Succeed())
+			})
+
+			AfterEach(func() {
+				if workspaceObj != nil {
+					cleanupWorkspace(workspaceObj)
+					workspaceObj = nil
+				}
+				if badConfigCM != nil {
+					_ = utils.TestingCluster.KubeClient.Delete(ctx, badConfigCM)
+					badConfigCM = nil
+				}
+			})
+		})
+
+		// User-defined env vars are preserved after cache injection.
+		Context(fmt.Sprintf("Provider %q: user env vars preserved after cache injection", provider), func() {
+			var workspaceObj *kaitov1beta1.Workspace
+
+			It("should retain user-defined env vars on the model container alongside injected cache vars", func() {
+				if !exp.ModelWeights.Supported {
+					Skip(fmt.Sprintf("provider %q does not support the model weights concern", provider))
+				}
+				uniqueID := fmt.Sprint("cache-env-pres-", rand.Intn(10000))
+
+				By("Creating a workspace with a custom user env var")
+				workspaceObj = generateCacheWorkspace(uniqueID, namespaceName, provider, kaitov1beta1.CacheSpec{
+					ModelCache: &kaitov1beta1.ModelCacheSpec{
+						Provider: provider,
+						Mode:     kaitov1beta1.CacheModeOpportunistic,
+					},
+				})
+				// Add a user env var to the model container.
+				if workspaceObj.Inference != nil && workspaceObj.Inference.Template != nil &&
+					len(workspaceObj.Inference.Template.Spec.Containers) > 0 {
+					workspaceObj.Inference.Template.Spec.Containers[0].Env = append(
+						workspaceObj.Inference.Template.Spec.Containers[0].Env,
+						corev1.EnvVar{Name: "USER_CUSTOM_ENV", Value: "/custom/user/path"},
+					)
+				}
+				createAndValidateWorkspace(workspaceObj)
+
+				By("Verifying cache is injected AND user env var is preserved")
+				me := exp.ForConcern(cache.CacheConcernModelWeights)
+				Eventually(func() error {
+					sts := &appsv1.StatefulSet{}
+					if err := utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, sts); err != nil {
+						return err
+					}
+					// Check injection happened.
+					for k, v := range me.RequiredLabels {
+						if actual := sts.Spec.Template.Labels[k]; actual != v {
+							return fmt.Errorf("cache not injected yet (label %s=%q, want %q)", k, actual, v)
+						}
+					}
+					// Check user env preserved.
+					if len(sts.Spec.Template.Spec.Containers) == 0 {
+						return fmt.Errorf("no containers in StatefulSet")
+					}
+					for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+						if e.Name == "USER_CUSTOM_ENV" && e.Value == "/custom/user/path" {
+							return nil
+						}
+					}
+					return fmt.Errorf("user env var USER_CUSTOM_ENV not found after cache injection")
+				}, 10*time.Minute, utils.PollInterval).Should(Succeed())
+			})
+
+			AfterEach(func() {
+				if workspaceObj != nil {
+					cleanupWorkspace(workspaceObj)
+					workspaceObj = nil
+				}
+			})
+		})
+
+		// Cache condition transitions to False when backend becomes unavailable.
+		Context(fmt.Sprintf("Provider %q: cache condition transitions to False when backend removed", provider), func() {
+			It("should set ModelCacheReady=False after cache backend is deleted", func() {
+				if !exp.ModelWeights.Supported {
+					Skip(fmt.Sprintf("provider %q does not support the model weights concern", provider))
+				}
+				Skip("Not yet implemented: controller does not re-evaluate cache readiness after initial setup")
+			})
+		})
+
+		// Cache backend scale down/up emits Ready/NotReady transitions.
+		Context(fmt.Sprintf("Provider %q: cache backend scale emits condition transitions", provider), func() {
+			It("should transition ModelCacheReady between True and False as backend scales", func() {
+				if !exp.ModelWeights.Supported {
+					Skip(fmt.Sprintf("provider %q does not support the model weights concern", provider))
+				}
+				Skip("Not yet implemented: controller does not watch backend pod events")
 			})
 		})
 
@@ -542,7 +787,7 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 				})
 				strength := "0.5"
 				workspaceObj.Inference.Adapters = []kaitov1beta1.AdapterSpec{{
-					Source:   &kaitov1beta1.DataSource{Name: "e2e-adapter", Image: "hariazstortest.azurecr.io/e2e-adapter:noop"},
+					Source:   &kaitov1beta1.DataSource{Name: "e2e-adapter", Image: testRegistryImage("e2e-adapter:noop")},
 					Strength: &strength,
 				}}
 				createAndValidateWorkspace(workspaceObj)
@@ -575,8 +820,8 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 				ws.Inference = nil
 				ws.Tuning = &kaitov1beta1.TuningSpec{
 					Method: kaitov1beta1.TuningMethodLora,
-					Input:  &kaitov1beta1.DataSource{Name: "e2e-tune-input", Image: "hariazstortest.azurecr.io/e2e-tune:input"},
-					Output: &kaitov1beta1.DataDestination{Image: "hariazstortest.azurecr.io/e2e-tune:output", ImagePushSecret: "acr-secret"},
+					Input:  &kaitov1beta1.DataSource{Name: "e2e-tune-input", Image: testRegistryImage("e2e-tune:input")},
+					Output: &kaitov1beta1.DataDestination{Image: testRegistryImage("e2e-tune:output"), ImagePushSecret: "acr-secret"},
 				}
 
 				By("Dry-run creating the Tuning+cache workspace (admission only)")
@@ -588,6 +833,100 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 			})
 		})
 
+		// Data-plane: warm cache hit validation. Creates a workspace twice —
+		// first run warms the cache, second run validates cache hits.
+		// Provider controls skip logic, workspace customization, and validation.
+		Context(fmt.Sprintf("Provider %q: cache hit on warm reload", provider), func() {
+			var workspaceObj *kaitov1beta1.Workspace
+
+			It("should validate cache hits on second load", func() {
+				if exp.CacheWarm == nil {
+					Skip(fmt.Sprintf("provider %q does not support cache warm testing", provider))
+				}
+				cfg := exp.CacheWarm()
+				if cfg.SkipReason != "" {
+					Skip(fmt.Sprintf("provider %q: %s", provider, cfg.SkipReason))
+				}
+
+				// Use provider-specified namespace (where workload identity
+				// federation is pre-configured) or fall back to the default
+				// e2e test namespace.
+				wsNamespace := namespaceName
+				if cfg.Namespace != "" {
+					wsNamespace = cfg.Namespace
+				}
+
+				h := newE2EHarnessInNamespace(provider, wsNamespace)
+				uniqueID := fmt.Sprint("cache-hit-", rand.Intn(10000))
+
+				buildCacheHitWorkspace := func(name string) *kaitov1beta1.Workspace {
+					ws := generateCacheWorkspace(name, wsNamespace, provider, kaitov1beta1.CacheSpec{
+						ModelCache: &kaitov1beta1.ModelCacheSpec{
+							Provider: provider,
+							Mode:     kaitov1beta1.CacheModeOpportunistic,
+						},
+					})
+					if cfg.WorkspaceCustomizer != nil {
+						cfg.WorkspaceCustomizer(ws)
+					}
+					return ws
+				}
+
+				By("First run: warming the cache")
+				workspaceObj = buildCacheHitWorkspace(uniqueID + "-warm")
+				createAndValidateWorkspace(workspaceObj)
+
+				By("Waiting for model to finish loading (InferenceReady=True)")
+				Eventually(func() bool {
+					_ = utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, workspaceObj)
+					for _, c := range workspaceObj.Status.Conditions {
+						if c.Type == string(kaitov1beta1.WorkspaceConditionTypeInferenceStatus) && c.Status == metav1.ConditionTrue {
+							return true
+						}
+					}
+					return false
+				}, 20*time.Minute, utils.PollInterval).Should(BeTrue(), "Model did not finish loading on warm-up run")
+
+				if cfg.ValidatePreWarm != nil {
+					By("Validating pre-warm expectations")
+					Expect(cfg.ValidatePreWarm(h, workspaceObj)).To(Succeed())
+				}
+
+				By("Deleting the warm-up workspace")
+				cleanupWorkspace(workspaceObj)
+				workspaceObj = nil
+
+				By("Second run: expecting cache hits")
+				workspaceObj = buildCacheHitWorkspace(uniqueID + "-hit")
+				createAndValidateWorkspace(workspaceObj)
+
+				By("Waiting for second model load to complete (InferenceReady=True)")
+				Eventually(func() bool {
+					_ = utils.TestingCluster.KubeClient.Get(ctx, client.ObjectKey{
+						Namespace: workspaceObj.Namespace, Name: workspaceObj.Name,
+					}, workspaceObj)
+					for _, c := range workspaceObj.Status.Conditions {
+						if c.Type == string(kaitov1beta1.WorkspaceConditionTypeInferenceStatus) && c.Status == metav1.ConditionTrue {
+							return true
+						}
+					}
+					return false
+				}, 20*time.Minute, utils.PollInterval).Should(BeTrue(), "Second workspace did not finish loading")
+
+				By("Validating post-warm expectations")
+				Expect(cfg.ValidatePostWarm(h, workspaceObj)).To(Succeed())
+			})
+
+			AfterEach(func() {
+				if workspaceObj != nil {
+					cleanupWorkspace(workspaceObj)
+					workspaceObj = nil
+				}
+			})
+		})
+
 		// Provider-declared e2e scenarios (provider-specific behaviour). Discovered
 		// automatically from the expectations registry; capability-gated so data-plane
 		// and disruptive scenarios only run when explicitly opted-in.
@@ -595,7 +934,6 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 			sc := sc
 			Context(fmt.Sprintf("Provider %q scenario", provider), func() {
 				It(sc.Name, func() {
-					gateScenarioCapability(sc.Capability)
 					h := newE2EHarness(provider)
 					Expect(sc.Run(h)).To(Succeed())
 				})
@@ -608,6 +946,11 @@ var _ = Describe("Cache Integration", Label("cache"), func() {
 // using template inference to allow running on CPU nodes without GPU validation.
 func generateCacheWorkspace(name, namespace string, provider kaitov1beta1.CacheProvider, cacheSpec kaitov1beta1.CacheSpec) *kaitov1beta1.Workspace {
 	_ = provider // provider is encoded in cacheSpec; kept for call-site clarity.
+
+	vllmImage := utils.GetEnv("DACS_CACHE_VLLM_IMAGE")
+	modelURL := utils.GetEnv("DACS_CACHE_MODEL_URL")
+	storageAccount := utils.GetEnv("DACS_CACHE_STORAGE_ACCOUNT")
+
 	ws := &kaitov1beta1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -618,7 +961,6 @@ func generateCacheWorkspace(name, namespace string, provider kaitov1beta1.CacheP
 		},
 	}
 	ws.Resource = kaitov1beta1.ResourceSpec{
-		InstanceType: "Standard_D32s_v3",
 		LabelSelector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{"apps": "vllm-cache"},
 		},
@@ -634,18 +976,28 @@ func generateCacheWorkspace(name, namespace string, provider kaitov1beta1.CacheP
 				ServiceAccountName: "vllm-sa",
 				Containers: []corev1.Container{
 					{
-						Name:    "vllm",
-						Image:   "hariazstortest.azurecr.io/vllm-cpu-streamer:v0.23.0-nocache",
-						Command: []string{"python3", "-m", "vllm.entrypoints.openai.api_server"},
+						Name:  "vllm",
+						Image: vllmImage,
 						Args: []string{
-							"--model=az://qwen/Qwen2.5-Coder-7B-Instruct",
+							"--model=" + modelURL,
 							"--dtype=float32",
 							"--max-model-len=512",
 							"--load-format=runai_streamer",
 							"--model-loader-extra-config={\"concurrency\":8}",
 						},
 						Env: []corev1.EnvVar{
-							{Name: "AZURE_STORAGE_ACCOUNT_NAME", Value: "harikaito"},
+							{Name: "AZURE_STORAGE_ACCOUNT_NAME", Value: storageAccount},
+						},
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/health",
+									Port: intstr.FromInt(8000),
+								},
+							},
+							InitialDelaySeconds: 30,
+							PeriodSeconds:       10,
+							FailureThreshold:    120,
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -690,7 +1042,7 @@ func generateCacheInferenceSet(name, namespace string, provider kaitov1beta1.Cac
 				MatchLabels: map[string]string{"apps": "vllm-cache"},
 			},
 			Template: kaitov1beta1.InferenceSetTemplate{
-				Resource:  kaitov1beta1.InferenceSetResourceSpec{InstanceType: "Standard_D32s_v3"},
+				Resource:  kaitov1beta1.InferenceSetResourceSpec{},
 				Inference: *base.Inference,
 				Cache:     &cacheSpec,
 			},
@@ -819,42 +1171,39 @@ func updateCacheMode(ws *kaitov1beta1.Workspace, mode kaitov1beta1.CacheMode) {
 	}, 2*time.Minute, utils.PollInterval).Should(Succeed(), "failed to update cache mode to %s", mode)
 }
 
-// gateScenarioCapability skips the current spec unless the capability required by a
-// provider scenario is enabled. Control-plane scenarios always run (given the suite
-// is enabled); data-plane and disruptive scenarios are opt-in to respect GPU and
-// cluster-mutation budgets.
-func gateScenarioCapability(capability cache.E2ECapability) {
-	switch capability {
-	case cache.E2ECapabilityDataPlane:
-		if utils.GetEnv("TEST_CACHE_DATAPLANE") != "true" {
-			Skip("data-plane scenario disabled (set TEST_CACHE_DATAPLANE=true; requires a serving model pod)")
-		}
-	case cache.E2ECapabilityDisruptive:
-		if utils.GetEnv("TEST_CACHE_DISRUPTIVE") != "true" {
-			Skip("disruptive scenario disabled (set TEST_CACHE_DISRUPTIVE=true; mutates shared cluster state)")
-		}
-	}
-}
-
 // e2eHarness implements cache.E2EHarness so provider-declared scenarios (which live
 // in the provider package) can drive the cluster without importing the e2e utils.
 type e2eHarness struct {
-	provider kaitov1beta1.CacheProvider
+	provider  kaitov1beta1.CacheProvider
+	namespace string
 }
 
 func newE2EHarness(provider kaitov1beta1.CacheProvider) cache.E2EHarness {
-	return &e2eHarness{provider: provider}
+	return &e2eHarness{provider: provider, namespace: namespaceName}
 }
 
-func (h *e2eHarness) Ctx() context.Context  { return ctx }
-func (h *e2eHarness) Client() client.Client { return utils.TestingCluster.KubeClient }
-func (h *e2eHarness) Namespace() string     { return namespaceName }
+func newE2EHarnessInNamespace(provider kaitov1beta1.CacheProvider, ns string) cache.E2EHarness {
+	return &e2eHarness{provider: provider, namespace: ns}
+}
+
+func (h *e2eHarness) Ctx() context.Context                 { return ctx }
+func (h *e2eHarness) Client() client.Client                { return utils.TestingCluster.KubeClient }
+func (h *e2eHarness) Namespace() string                    { return h.namespace }
+func (h *e2eHarness) Provider() kaitov1beta1.CacheProvider { return h.provider }
 func (h *e2eHarness) Logf(format string, args ...any) {
 	GinkgoWriter.Printf(format+"\n", args...)
 }
 
+func (h *e2eHarness) PodLogs(podName string) (string, error) {
+	clientset, err := utils.GetK8sClientset()
+	if err != nil {
+		return "", fmt.Errorf("getting clientset: %w", err)
+	}
+	return utils.GetPodLogs(clientset, h.namespace, podName, "")
+}
+
 func (h *e2eHarness) NewCacheWorkspace(idPrefix string, spec kaitov1beta1.CacheSpec) *kaitov1beta1.Workspace {
-	return generateCacheWorkspace(fmt.Sprintf("%s-%d", idPrefix, rand.Intn(100000)), namespaceName, h.provider, spec)
+	return generateCacheWorkspace(fmt.Sprintf("%s-%d", idPrefix, rand.Intn(100000)), h.namespace, h.provider, spec)
 }
 
 func (h *e2eHarness) Poll(timeout time.Duration, fn func() error) error {
@@ -869,4 +1218,21 @@ func (h *e2eHarness) Poll(timeout time.Duration, fn func() error) error {
 		}
 		time.Sleep(utils.PollInterval)
 	}
+}
+
+// testRegistryImage returns a fully qualified image reference using the
+// DACS_CACHE_VLLM_IMAGE registry prefix. For non-vllm images (adapters, tuning)
+// it derives the registry from the vllm image env var.
+func testRegistryImage(imageAndTag string) string {
+	base := utils.GetEnv("DACS_CACHE_VLLM_IMAGE")
+	if base == "" {
+		return imageAndTag // will be caught by BeforeEach skip
+	}
+	// Extract registry from "registry/repo:tag" → "registry"
+	idx := strings.LastIndex(base, "/")
+	if idx < 0 {
+		return imageAndTag
+	}
+	registry := base[:idx]
+	return registry + "/" + imageAndTag
 }

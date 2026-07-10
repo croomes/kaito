@@ -179,15 +179,20 @@ func mergeMutations(dst, src *PodMutations) {
 		}
 	}
 
-	// Deduplicate env vars by name (first wins — user/dst values take priority).
-	existingEnvs := make(map[string]struct{}, len(dst.EnvVars))
-	for _, e := range dst.EnvVars {
-		existingEnvs[e.Name] = struct{}{}
+	// Deduplicate env vars by name. For path-list vars, merge by appending
+	// with colon separator. For all others, first wins (dst takes priority).
+	existingEnvs := make(map[string]int, len(dst.EnvVars))
+	for i, e := range dst.EnvVars {
+		existingEnvs[e.Name] = i
 	}
 	for _, e := range src.EnvVars {
-		if _, exists := existingEnvs[e.Name]; !exists {
+		if idx, exists := existingEnvs[e.Name]; exists {
+			if isPathListEnv(e.Name) {
+				dst.EnvVars[idx].Value = dst.EnvVars[idx].Value + ":" + e.Value
+			}
+		} else {
 			dst.EnvVars = append(dst.EnvVars, e)
-			existingEnvs[e.Name] = struct{}{}
+			existingEnvs[e.Name] = len(dst.EnvVars) - 1
 		}
 	}
 
@@ -205,15 +210,22 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 
 	container := &spec.Containers[0]
 
-	// Deduplicate env vars (first wins — existing user values take priority).
-	existingEnvs := make(map[string]struct{}, len(container.Env))
-	for _, e := range container.Env {
-		existingEnvs[e.Name] = struct{}{}
+	// Deduplicate env vars. For path-list vars (LD_LIBRARY_PATH, PATH) merge
+	// by appending the new value with a colon separator. For all others, first
+	// wins — existing user values take priority.
+	existingEnvs := make(map[string]int, len(container.Env))
+	for i, e := range container.Env {
+		existingEnvs[e.Name] = i
 	}
 	for _, e := range mutations.EnvVars {
-		if _, exists := existingEnvs[e.Name]; !exists {
+		if idx, exists := existingEnvs[e.Name]; exists {
+			if isPathListEnv(e.Name) {
+				container.Env[idx].Value = container.Env[idx].Value + ":" + e.Value
+			}
+			// else: first wins, skip the mutation value
+		} else {
 			container.Env = append(container.Env, e)
-			existingEnvs[e.Name] = struct{}{}
+			existingEnvs[e.Name] = len(container.Env) - 1
 		}
 	}
 
@@ -252,6 +264,13 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 			existingInits[c.Name] = struct{}{}
 		}
 	}
+}
+
+// isPathListEnv returns true for environment variables that contain colon-separated
+// path lists. When a user-defined value and a cache mutation both set these, the
+// values are concatenated instead of one winning.
+func isPathListEnv(name string) bool {
+	return name == "LD_LIBRARY_PATH"
 }
 
 // mountCacheConfigMaps merges user-provided Config ConfigMaps with provider Helm

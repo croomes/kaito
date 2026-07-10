@@ -26,7 +26,6 @@ func init() {
 	cache.RegisterExpectations(cache.Expectations{
 		Provider:          kaitov1beta1.CacheProvider(ProviderName),
 		NewForConformance: func() cache.Provider { return NewProvider() },
-		E2EExempt:         true,
 		ModelWeights: cache.MutationExpectation{
 			Supported:   true,
 			ExpectEmpty: true,

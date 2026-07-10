@@ -18,6 +18,8 @@ package cache_test
 // import list is all that is required for the registry-driven suite to discover it.
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -108,6 +110,50 @@ func TestProviderConformance_ShippedProviders(t *testing.T) {
 		}
 		if got := kaitov1beta1.CacheProvider(e.NewForConformance().Name()); got != name {
 			t.Errorf("provider %q factory produced instance named %q", name, got)
+		}
+	}
+}
+
+// TestAllProviderDirectoriesRegisterExpectations enforces that every subdirectory
+// under pkg/cache/ (which represents a cache provider) has registered its
+// conformance Expectations. This prevents a new provider from being added without
+// declaring its E2E contract — the common E2E scenarios automatically run against
+// all registered providers, so missing registration means silent E2E coverage gaps.
+//
+// To satisfy this test, a new provider must:
+//  1. Create a package under pkg/cache/<provider-name>/
+//  2. Call cache.RegisterExpectations(...) in its init()
+//  3. Be blank-imported in this test file
+func TestAllProviderDirectoriesRegisterExpectations(t *testing.T) {
+	// Go test runs from the package directory, so subdirs are direct children.
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("failed to read pkg/cache directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := entry.Name()
+
+		// A provider directory must contain at least one .go file.
+		goFiles, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+		if len(goFiles) == 0 {
+			continue
+		}
+
+		provider := kaitov1beta1.CacheProvider(dir)
+		exp, ok := cache.GetExpectations(provider)
+		if !ok {
+			t.Errorf("provider directory %q exists under pkg/cache/ but did not register "+
+				"Expectations via cache.RegisterExpectations(). Every provider must declare "+
+				"its conformance contract so the common E2E scenarios are exercised.", dir)
+			continue
+		}
+		if exp.NewForConformance == nil {
+			t.Errorf("provider %q registered Expectations but NewForConformance is nil; "+
+				"a conformance factory is required for offline mutation testing", dir)
 		}
 	}
 }

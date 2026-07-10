@@ -16,6 +16,12 @@ package dacs
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/cache"
@@ -65,6 +71,7 @@ func init() {
 			Validate: validateKVCacheMutations,
 		},
 		E2EScenarios: dacsE2EScenarios(),
+		CacheWarm:    dacsCacheWarm,
 	})
 }
 
@@ -114,4 +121,108 @@ func validateKVCacheMutations(m *cache.PodMutations) []error {
 	}
 
 	return errs
+}
+
+// dacsCacheWarm checks DACS-specific prerequisites and returns the cache warm
+// test configuration. All validation (env vars, log patterns) lives here so the
+// generic e2e runner has no DACS-specific logic.
+func dacsCacheWarm() *cache.CacheWarmConfig {
+	modelURL := os.Getenv("DACS_CACHE_MODEL_URL")
+	if modelURL == "" {
+		return &cache.CacheWarmConfig{SkipReason: "DACS_CACHE_MODEL_URL not set"}
+	}
+	storageAccount := os.Getenv("DACS_CACHE_STORAGE_ACCOUNT")
+	if storageAccount == "" {
+		return &cache.CacheWarmConfig{SkipReason: "DACS_CACHE_STORAGE_ACCOUNT not set"}
+	}
+	// Namespace where workload identity federation is already configured for
+	// the vllm-sa ServiceAccount. Falls back to "default" so that test runs
+	// don't depend on random e2e namespace names.
+	cacheNS := os.Getenv("DACS_CACHE_NAMESPACE")
+	if cacheNS == "" {
+		cacheNS = "default"
+	}
+	return &cache.CacheWarmConfig{
+		Namespace: cacheNS,
+		WorkspaceCustomizer: func(ws *kaitov1beta1.Workspace) {
+			if ws.Inference == nil || ws.Inference.Template == nil ||
+				len(ws.Inference.Template.Spec.Containers) == 0 {
+				return
+			}
+			c := &ws.Inference.Template.Spec.Containers[0]
+			c.Args = []string{
+				"--model=" + modelURL,
+				"--dtype=float32",
+				"--max-model-len=512",
+				"--load-format=runai_streamer",
+				"--model-loader-extra-config={\"concurrency\":8}",
+			}
+			found := false
+			for i := range c.Env {
+				if c.Env[i].Name == "AZURE_STORAGE_ACCOUNT_NAME" {
+					c.Env[i].Value = storageAccount
+					found = true
+					break
+				}
+			}
+			if !found {
+				c.Env = append(c.Env, corev1.EnvVar{
+					Name:  "AZURE_STORAGE_ACCOUNT_NAME",
+					Value: storageAccount,
+				})
+			}
+		},
+		ValidatePreWarm: func(h cache.E2EHarness, ws *kaitov1beta1.Workspace) error {
+			logs, err := h.PodLogs(ws.Name + "-0")
+			if err != nil {
+				return fmt.Errorf("reading pre-warm pod logs: %w", err)
+			}
+			n, found := parseCacheStatValue(logs, "RemoteClient")
+			if !found {
+				return fmt.Errorf("pre-warm pod logs do not contain %q stat; cache may not be warming", "RemoteClient=")
+			}
+			if n == 0 {
+				n, found = parseCacheStatValue(logs, "RemoteCache")
+				if found && n == 0 {
+					return fmt.Errorf("pre-warm pod logs show RemoteCache=0; expected >0 blob reads during warm-up")
+				}
+			}
+			return nil
+		},
+		ValidatePostWarm: func(h cache.E2EHarness, ws *kaitov1beta1.Workspace) error {
+			logs, err := h.PodLogs(ws.Name + "-0")
+			if err != nil {
+				return fmt.Errorf("reading post-warm pod logs: %w", err)
+			}
+			n, found := parseCacheStatValue(logs, "RemoteCache")
+			if !found {
+				return fmt.Errorf("post-warm pod logs do not contain %q stat; cache may not be hitting", "RemoteCache=")
+			}
+			if n == 0 {
+				return fmt.Errorf("post-warm pod logs show RemoteCache=0; expected >0 cache hits on warm reload")
+			}
+			return nil
+		},
+	}
+}
+
+// parseCacheStatValue extracts the integer value for a key like "RemoteCache=807"
+// from DACS StreamingClient log lines. Returns (value, true) on success.
+var cacheStatRe = regexp.MustCompile(`(\w+)=(\d+)`)
+
+func parseCacheStatValue(logs, key string) (int, bool) {
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, key+"=") {
+			continue
+		}
+		for _, match := range cacheStatRe.FindAllStringSubmatch(line, -1) {
+			if match[1] == key {
+				n, err := strconv.Atoi(match[2])
+				if err == nil {
+					return n, true
+				}
+			}
+		}
+	}
+	return 0, false
 }

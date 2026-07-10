@@ -47,13 +47,13 @@ const (
 	E2ECapabilityControlPlane E2ECapability = "controlplane"
 
 	// E2ECapabilityDataPlane scenarios require a model pod that actually serves
-	// (real weights/GPU or CPU serving) so cache hit/miss counters can be observed.
-	// Gated behind TEST_CACHE_DATAPLANE=true.
+	// (real weights or CPU serving) so cache hit/miss counters can be observed.
+	// Runs on any node type — KAITO's provisioner handles CPU/GPU placement.
 	E2ECapabilityDataPlane E2ECapability = "dataplane"
 
 	// E2ECapabilityDisruptive scenarios mutate shared cluster state (redeploy the
 	// controller, upgrade/remove the cache backend, scale nodes, delete a shared CR).
-	// Gated behind TEST_CACHE_DISRUPTIVE=true and must clean up after themselves.
+	// These should clean up after themselves.
 	E2ECapabilityDisruptive E2ECapability = "disruptive"
 )
 
@@ -69,6 +69,9 @@ type E2EHarness interface {
 	// Namespace returns the namespace scenarios should create resources in.
 	Namespace() string
 
+	// Provider returns the cache provider name this harness is configured for.
+	Provider() kaitov1beta1.CacheProvider
+
 	// NewCacheWorkspace builds (but does not create) a standard cache-enabled
 	// Workspace with a unique name derived from idPrefix. Scenarios mutate the
 	// returned object and create it via Client().
@@ -77,6 +80,9 @@ type E2EHarness interface {
 	// Poll retries fn until it returns nil or the timeout elapses, returning the
 	// last error. Used to wait for eventual controller reconciliation.
 	Poll(timeout time.Duration, fn func() error) error
+
+	// PodLogs returns the current log output for a pod in the test namespace.
+	PodLogs(podName string) (string, error)
 
 	// Logf records progress in the test output.
 	Logf(format string, args ...any)
@@ -120,3 +126,4 @@ func GetWorkspaceCondition(h E2EHarness, ws *kaitov1beta1.Workspace, condType st
 	}
 	return metav1.Condition{}, false, nil
 }
+
