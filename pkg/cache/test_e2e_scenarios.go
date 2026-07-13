@@ -126,4 +126,3 @@ func GetWorkspaceCondition(h E2EHarness, ws *kaitov1beta1.Workspace, condType st
 	}
 	return metav1.Condition{}, false, nil
 }
-
