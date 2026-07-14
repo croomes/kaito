@@ -78,7 +78,7 @@ inference:
   preset:
     name: "microsoft/phi-4"
 cache:
-  modelWeights:
+  modelCache:
     provider: dacs
     mode: Opportunistic
   kvCache:
@@ -100,13 +100,29 @@ You can configure each concern independently. For example, use `Required` for mo
 
 ```yaml
 cache:
-  modelWeights:
+  modelCache:
     provider: dacs
     mode: Required
   kvCache:
     provider: dacs
     mode: Opportunistic
 ```
+
+### Cleanup on Delete
+
+`modelCache.cleanupOnDelete` is reserved for future use:
+
+```yaml
+cache:
+  modelCache:
+    provider: dacs
+    mode: Opportunistic
+    cleanupOnDelete: true   # reserved — currently has no effect
+```
+
+:::note Not yet implemented
+Setting `cleanupOnDelete: true` currently has **no effect**. Cached model chunks are not explicitly evicted from the DACS cache servers when a workspace is deleted — they are reclaimed by the cache servers' own TTL/eviction policy. The field is accepted today so specs remain forward-compatible once invalidation-on-delete is implemented.
+:::
 
 ## How It Works
 
@@ -119,6 +135,20 @@ When model weight caching is enabled, KAITO applies the following to inference p
 3. **RunAI streamer env vars** — Enables the cache layer for model streaming from Azure Blob
 
 The RunAI model streamer (used with `--load-format=runai_streamer`) fetches model weights from Azure Blob Storage (using `az://` model paths). With cache enabled, reads go through the DACS NVMe cache layer — cache hits are served from local NVMe, misses fall through to blob storage and are cached for subsequent requests.
+
+### Cache Readiness Conditions
+
+KAITO reports cache status through the `ModelCacheReady` and `KVCacheReady` workspace conditions:
+
+```bash
+kubectl get workspace <name> -o jsonpath='{.status.conditions[?(@.type=="ModelCacheReady")]}'
+```
+
+:::note What "ready" means
+These conditions reflect **cache backend (cluster) readiness** — i.e. the DACS `Cache` CR reports its `Ready` condition as `True` and the cache servers are reachable. They do **not** guarantee that this workspace's specific model weights have already been warmed into the cache.
+
+As a result, a workspace can show `ModelCacheReady=True` while the first model load is still a cache **miss**. This is expected and harmless: a miss transparently falls through to Azure Blob Storage and populates the cache, so subsequent loads are served from NVMe. In `Required` mode, deployment is unblocked once the cache backend is ready, not once the model is fully warmed.
+:::
 
 ### KV Cache Sharing
 
@@ -227,7 +257,15 @@ The output should include `distributedCache=true`.
 | `cache.providers.dacs.discoveryEndpoint` | DACS cache server discovery URL (auto-discovered if empty) | `""` |
 | `cache.providers.dacs.kvCacheEnabled` | Enable KV cache support | `true` |
 | `cache.providers.dacs.kvConnectorProtocol` | KV connector transport (`tcp` or `rdma`) | `tcp` |
+| `cache.providers.dacs.clientImage` | OCI image bundling the DACS client libraries (mounted into inference pods) | `""` |
 | `cache.providers.dacs.blobEndpoint` | Azure Blob Storage endpoint (for prewarm Jobs) | `""` |
 | `cache.providers.dacs.blobContainer` | Blob container for model storage | `kaito-models` |
 | `cache.providers.dacs.blobPrefix` | Path prefix within the container | `kaito-models` |
 | `cache.providers.dacs.prewarmImage` | Image for prewarm Jobs | `""` |
+
+:::warning glibc compatibility
+The DACS client libraries (`libStorageDirect.so`) bundled in `cache.providers.dacs.clientImage`
+are built against **glibc 2.35** (`manylinux_2_35`). Any inference/base image that consumes the
+cache **must be glibc 2.35 or newer (Ubuntu 22.04+)**. On an older base the runai model streamer
+will fail to load the library at runtime.
+:::

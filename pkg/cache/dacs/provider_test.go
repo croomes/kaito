@@ -44,7 +44,7 @@ func newFakeProvider(objects ...runtime.Object) *Provider {
 }
 
 func newReadyCache() *unstructured.Unstructured {
-	return newCache(DefaultCacheName)
+	return newCache(defaultCacheName)
 }
 
 func newCache(name string) *unstructured.Unstructured {
@@ -54,7 +54,7 @@ func newCache(name string) *unstructured.Unstructured {
 			"kind":       "Cache",
 			"metadata": map[string]interface{}{
 				"name":      name,
-				"namespace": CacheNamespace,
+				"namespace": defaultCacheNamespace,
 			},
 			"status": map[string]interface{}{
 				"conditions": []interface{}{
@@ -225,15 +225,16 @@ func TestPodMutations_ModelWeights(t *testing.T) {
 	}
 
 	// Should have DACS discovery env vars (no KAITO_MODEL_PATH).
-	if len(mutations.EnvVars) != 6 {
-		t.Fatalf("expected 6 env vars, got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
+	if len(mutations.EnvVars) != 5 {
+		t.Fatalf("expected 5 env vars, got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
 	}
 	envVars := envVarMap(mutations.EnvVars)
 	if envVars["RUNAI_STREAMER_CACHE_ENABLED"] != "true" {
 		t.Errorf("RUNAI_STREAMER_CACHE_ENABLED: got %q, want true", envVars["RUNAI_STREAMER_CACHE_ENABLED"])
 	}
-	if !strings.Contains(envVars["CACHE_DISCOVERY_URL"], DefaultDiscoveryEndpoint) {
-		t.Errorf("CACHE_DISCOVERY_URL: got %q, want it to contain %q", envVars["CACHE_DISCOVERY_URL"], DefaultDiscoveryEndpoint)
+	wantEndpoint := defaultCacheName + "-discovery." + defaultCacheNamespace + ".svc.cluster.local"
+	if envVars["CACHE_DISCOVERY_URL"] != wantEndpoint {
+		t.Errorf("CACHE_DISCOVERY_URL: got %q, want %q", envVars["CACHE_DISCOVERY_URL"], wantEndpoint)
 	}
 	if envVars["CACHE_SERVER_PORT"] != "9065" {
 		t.Errorf("CACHE_SERVER_PORT: got %q, want 9065", envVars["CACHE_SERVER_PORT"])
@@ -275,8 +276,8 @@ func TestPodMutations_ModelWeightsCustomPrefix(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(mutations.EnvVars) != 6 {
-		t.Fatalf("expected 6 env vars, got %d", len(mutations.EnvVars))
+	if len(mutations.EnvVars) != 5 {
+		t.Fatalf("expected 5 env vars, got %d", len(mutations.EnvVars))
 	}
 }
 
@@ -302,8 +303,8 @@ func TestPodMutations_ModelWeightsNoModelName(t *testing.T) {
 	}
 
 	// Same env vars regardless of model name (no KAITO_MODEL_PATH).
-	if len(mutations.EnvVars) != 6 {
-		t.Errorf("expected 6 env vars, got %d", len(mutations.EnvVars))
+	if len(mutations.EnvVars) != 5 {
+		t.Errorf("expected 5 env vars, got %d", len(mutations.EnvVars))
 	}
 }
 
@@ -350,8 +351,9 @@ func TestPodMutations_KVCacheOnly(t *testing.T) {
 	if cfg.KVConnectorExtraConfig["protocol"] != "tcp" {
 		t.Errorf("protocol: got %v, want tcp", cfg.KVConnectorExtraConfig["protocol"])
 	}
-	if cfg.KVConnectorExtraConfig["locator_nodes"] != DefaultDiscoveryEndpoint {
-		t.Errorf("locator_nodes: got %v, want %s", cfg.KVConnectorExtraConfig["locator_nodes"], DefaultDiscoveryEndpoint)
+	wantLocator := defaultCacheName + "-discovery." + defaultCacheNamespace + ".svc.cluster.local"
+	if cfg.KVConnectorExtraConfig["locator_nodes"] != wantLocator {
+		t.Errorf("locator_nodes: got %v, want %s", cfg.KVConnectorExtraConfig["locator_nodes"], wantLocator)
 	}
 
 	// Should NOT have init containers.
@@ -380,8 +382,8 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("model weights: unexpected error: %v", err)
 	}
-	if len(mwMutations.EnvVars) != 6 {
-		t.Errorf("model weights should have 6 RUNAI env vars, got %v", mwMutations.EnvVars)
+	if len(mwMutations.EnvVars) != 5 {
+		t.Errorf("model weights should have 5 RUNAI env vars, got %v", mwMutations.EnvVars)
 	}
 	for _, env := range mwMutations.EnvVars {
 		if env.Name == "VLLM_KV_TRANSFER_CONFIG" {
@@ -507,8 +509,9 @@ func TestResolveDiscoveryEndpoint_FallbackToDefault(t *testing.T) {
 		}), cfg)
 
 	endpoint := p.resolveDiscoveryEndpoint("")
-	if endpoint != DefaultDiscoveryEndpoint {
-		t.Fatalf("expected default endpoint, got %q", endpoint)
+	wantEndpoint := defaultCacheName + "-discovery." + defaultCacheNamespace + ".svc.cluster.local"
+	if endpoint != wantEndpoint {
+		t.Fatalf("expected default endpoint %q, got %q", wantEndpoint, endpoint)
 	}
 }
 
@@ -604,8 +607,8 @@ func TestEventObject(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *unstructured.Unstructured, got %T", obj)
 	}
-	if unstructuredObj.GetName() != DefaultCacheName {
-		t.Fatalf("event object name: got %q, want %s", unstructuredObj.GetName(), DefaultCacheName)
+	if unstructuredObj.GetName() != defaultCacheName {
+		t.Fatalf("event object name: got %q, want %s", unstructuredObj.GetName(), defaultCacheName)
 	}
 }
 
@@ -646,7 +649,7 @@ var _ = metav1.Now
 
 // --- P4 / t12: multiple Cache CRs without a default must fail closed ---
 //
-// When neither a default cache (DefaultCacheName) nor an explicit cacheName is
+// When neither a default cache (defaultCacheName) nor an explicit cacheName is
 // resolvable and more than one Cache CR exists, both IsAvailable and IsReady must
 // surface a clear "multiple ... no default" error instead of silently picking one.
 

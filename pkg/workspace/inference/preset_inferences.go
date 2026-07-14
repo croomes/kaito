@@ -222,8 +222,12 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 		podOpts = append(podOpts, SetBenchmarkConfig(distributed))
 	}
 
-	// Inject cache provider mutations (env vars, volumes, etc.) when enabled.
-	if workspaceObj.Cache != nil {
+	// Cache injection only matters when the model is loaded via the run:ai streamer
+	// (--load-format=runai_streamer, --model=az://...); the DACS client hooks the
+	// streamer's Azure reads. With the default HuggingFace download path nothing
+	// dlopens libStorageDirect.so, so injecting env/volume/label is a silent no-op.
+	cacheApplicable := workspaceObj.Cache != nil && streamingLoadFormat == "runai_streamer"
+	if cacheApplicable {
 		podOpts = append(podOpts, cache.SetCacheMutations())
 	}
 
@@ -232,7 +236,7 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 	}
 
 	// Add cache pod template labels (for webhook-based injection).
-	if workspaceObj.Cache != nil {
+	if cacheApplicable {
 		ssOpts = append(ssOpts, cache.SetCachePodTemplateLabels())
 	}
 

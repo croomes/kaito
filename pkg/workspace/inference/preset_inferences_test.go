@@ -33,6 +33,7 @@ import (
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	"github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/cache"
 	"github.com/kaito-project/kaito/pkg/featuregates"
 	"github.com/kaito-project/kaito/pkg/sku"
 	"github.com/kaito-project/kaito/pkg/utils"
@@ -479,6 +480,124 @@ func TestGeneratePresetInference(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// guardCacheProvider is a mock cache.Provider that is always available and ready
+// and injects a sentinel label + env var whenever its PodMutations is invoked.
+// It lets tests prove whether the preset pipeline actually wired cache injection.
+type guardCacheProvider struct{ name string }
+
+const (
+	guardCacheLabelKey = "cache-guard/injected"
+	guardCacheEnvName  = "CACHE_GUARD_INJECTED"
+)
+
+func (p *guardCacheProvider) Name() string { return p.name }
+
+func (p *guardCacheProvider) IsAvailable(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
+func (p *guardCacheProvider) IsReady(_ context.Context, _ string) (bool, string, error) {
+	return true, "ready", nil
+}
+
+func (p *guardCacheProvider) PodMutations(_ context.Context, _ cache.CacheConcern, _ *v1beta1.Workspace, _, _, _ string) (*cache.PodMutations, error) {
+	return &cache.PodMutations{
+		Labels:  map[string]string{guardCacheLabelKey: "true"},
+		EnvVars: []corev1.EnvVar{{Name: guardCacheEnvName, Value: "true"}},
+	}, nil
+}
+
+func (p *guardCacheProvider) Cleanup(_ context.Context, _ *v1beta1.Workspace, _ string) error {
+	return nil
+}
+
+// TestGeneratePresetInference_CacheGatedOnStreaming is the regression guard for
+// the "cache is a silent no-op" bug: a preset workspace that requests a cache but
+// loads the model via the default HuggingFace download path (--load_format=auto,
+// i.e. streaming disabled) must NOT receive any cache injection, since nothing in
+// that pod consumes the DACS client. The guard provider is always available and
+// would inject a sentinel label/env if the pipeline let it through, so absence of
+// the sentinel proves the gate held. This runs in the standard unit-test suite,
+// unlike the DACS e2e which only runs when TEST_CACHE_ENABLED + DACS_CACHE_* are
+// set on a GPU cluster.
+func TestGeneratePresetInference_CacheGatedOnStreaming(t *testing.T) {
+	test.RegisterTestModel()
+	t.Setenv("CLOUD_PROVIDER", consts.AzureCloudName)
+	t.Setenv("PRESET_REGISTRY_NAME", "test-registry")
+	t.Setenv("RELEASE_NAMESPACE", "kaito")
+
+	provider := &guardCacheProvider{name: "cache-guard-preset"}
+	cache.Register(provider)
+
+	origGate := featuregates.FeatureGates[consts.FeatureFlagDistributedCache]
+	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
+	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = origGate }()
+
+	// Sanity: the guard provider really would inject if invoked, so that the
+	// negative assertion below is meaningful rather than trivially true.
+	m, err := provider.PodMutations(context.TODO(), cache.CacheConcernModelWeights, nil, "", "", "")
+	if err != nil || m == nil || m.Labels[guardCacheLabelKey] != "true" {
+		t.Fatalf("guard provider is not hot: err=%v mutations=%+v", err, m)
+	}
+
+	mockClient := test.NewClient()
+	mockClient.On("Get", mock.IsType(context.TODO()), mock.Anything, mock.IsType(&corev1.ConfigMap{}), mock.Anything).Return(nil)
+	mockClient.On("Get", mock.IsType(context.TODO()), mock.Anything, mock.IsType(&storagev1.StorageClass{}), mock.Anything).Return(nil)
+
+	// Preset vLLM workspace with a cache requested but streaming disabled.
+	workspace := test.MockWorkspaceWithPresetVLLM.DeepCopy()
+	nodeCount := 1
+	//nolint:staticcheck //SA1019: deprecated Resource.Count field
+	workspace.Resource.Count = &nodeCount
+	workspace.Status.WorkerNodes = []string{"test-node-1"}
+	workspace.Inference.Adapters = nil
+	workspace.Inference.Config = ""
+	workspace.Cache = &v1beta1.CacheSpec{
+		ModelCache: &v1beta1.ModelCacheSpec{
+			Provider: v1beta1.CacheProvider(provider.name),
+			Mode:     v1beta1.CacheModeOpportunistic,
+		},
+	}
+
+	estimator := &nodesestimator.NodeEstimator{}
+	req, reqErr := workspaceutil.NodeEstimateRequestFromWorkspace(t.Context(), workspace, mockClient)
+	if reqErr != nil {
+		t.Fatalf("failed to build estimate request: %v", reqErr)
+	}
+	nc, err := estimator.EstimateNodeCount(t.Context(), req, mockClient)
+	if err != nil {
+		t.Fatalf("failed to estimate node count: %v", err)
+	}
+	workspace.Status.TargetNodeCount = int32(nc)
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: workspace.Name, Namespace: workspace.Namespace},
+		Spec:       corev1.ServiceSpec{ClusterIP: "10.0.0.1"},
+	}
+	mockClient.CreateOrUpdateObjectInMap(svc)
+
+	model := plugin.KaitoModelRegister.MustGet("test-model")
+
+	createdObject, err := GeneratePresetInference(context.TODO(), workspace, test.MockWorkspaceWithPresetHash, model, mockClient, nil)
+	if err != nil {
+		t.Fatalf("GeneratePresetInference returned error: %v", err)
+	}
+	ss := createdObject.(*appsv1.StatefulSet)
+
+	// The model loads via --load_format=auto (no runai_streamer), so no cache
+	// mutations should have been wired: no sentinel label, no sentinel env var.
+	if _, ok := ss.Spec.Template.Labels[guardCacheLabelKey]; ok {
+		t.Errorf("expected no cache label when streaming is disabled, but found %q on pod template", guardCacheLabelKey)
+	}
+	for _, c := range ss.Spec.Template.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == guardCacheEnvName {
+				t.Errorf("expected no cache env var when streaming is disabled, but found %q in container %q", guardCacheEnvName, c.Name)
+			}
+		}
 	}
 }
 

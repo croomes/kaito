@@ -285,6 +285,11 @@ type ModelCacheSpec struct {
 	Config string `json:"config,omitempty"`
 
 	// CleanupOnDelete invalidates cached model data when workspace is deleted.
+	//
+	// NOTE: Not yet implemented. This field is reserved for future use; setting it
+	// currently has no effect. Cached model chunks are managed by the DACS cache
+	// servers' own TTL/eviction policy and are not explicitly invalidated on
+	// workspace deletion. See https://github.com/kaito-project/kaito for status.
 	// +optional
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
 }

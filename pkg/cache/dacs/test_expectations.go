@@ -51,7 +51,6 @@ func init() {
 			RequiredEnvVars: []string{
 				"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED",
 				"RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_LIB",
-				"LD_LIBRARY_PATH",
 				"RUNAI_STREAMER_CACHE_ENABLED",
 				"CACHE_DISCOVERY_URL",
 				"CACHE_SERVER_PORT",
@@ -88,7 +87,7 @@ func validateModelWeightsMutations(m *cache.PodMutations) []error {
 		errs = append(errs, fmt.Errorf("CACHE_DISCOVERY_URL must be a non-empty discovery endpoint"))
 	}
 
-	wantPort := fmt.Sprintf("%d", DefaultDiscoveryPort)
+	wantPort := fmt.Sprintf("%d", defaultDiscoveryPort)
 	if port, ok := m.EnvValue("CACHE_SERVER_PORT"); !ok || port != wantPort {
 		errs = append(errs, fmt.Errorf("CACHE_SERVER_PORT = %q, want %q", port, wantPort))
 	}

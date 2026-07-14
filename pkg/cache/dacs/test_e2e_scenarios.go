@@ -15,7 +15,6 @@ package dacs
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -60,16 +59,6 @@ func dacsE2EScenarios() []cache.E2EScenario {
 			Capability: cache.E2ECapabilityControlPlane,
 			Run:        scenarioCacheNameOverrideHonored,
 		},
-		// t28: a pre-existing LD_LIBRARY_PATH on the model container is retained in
-		// the env list; the provider appends its own cache-lib path as a separate
-		// entry (it does not merge them). DACS-specific because it validates the
-		// DACS client library path injection behavior.
-		{
-			Name:       "pre-existing LD_LIBRARY_PATH is retained alongside the injected cache libs",
-			Capability: cache.E2ECapabilityControlPlane,
-			Run:        scenarioLDLibraryPathPreserved,
-		},
-
 		// --- Gated scenarios (skipped unless opted-in) ---
 
 		// t27: a bad client ImageVolume must fail the pod clearly and must NOT
@@ -128,7 +117,7 @@ func scenarioCacheNameOverrideHonored(h cache.E2EHarness) error {
 	defer func() { _ = h.Client().Delete(h.Ctx(), badWS) }()
 
 	// Real name → injection with the matching discovery endpoint.
-	goodCM, err := createCacheNameConfigMap(h, "dacs-name-good", DefaultCacheName)
+	goodCM, err := createCacheNameConfigMap(h, "dacs-name-good", defaultCacheName)
 	if err != nil {
 		return err
 	}
@@ -152,7 +141,7 @@ func scenarioCacheNameOverrideHonored(h cache.E2EHarness) error {
 			return fmt.Errorf("good-name StatefulSet not created yet: %w", err)
 		}
 		if v := goodSTS.Spec.Template.Labels[InjectLabelKey]; v != InjectLabelValue {
-			return fmt.Errorf("named existing cache %q did not trigger injection", DefaultCacheName)
+			return fmt.Errorf("named existing cache %q did not trigger injection", defaultCacheName)
 		}
 		return nil
 	}); err != nil {
@@ -166,63 +155,6 @@ func scenarioCacheNameOverrideHonored(h cache.E2EHarness) error {
 	}
 	h.Logf("cacheName override honored: existing name injected, missing name did not")
 	return nil
-}
-
-func scenarioLDLibraryPathPreserved(h cache.E2EHarness) error {
-	const preExisting = "/custom/preexisting/lib"
-
-	ws := h.NewCacheWorkspace("dacs-ldpath", kaitov1beta1.CacheSpec{
-		ModelCache: &kaitov1beta1.ModelCacheSpec{
-			Provider: kaitov1beta1.CacheProvider(ProviderName),
-			Mode:     kaitov1beta1.CacheModeOpportunistic,
-		},
-	})
-	// Seed a pre-existing LD_LIBRARY_PATH on the model container.
-	if ws.Inference != nil && ws.Inference.Template != nil && len(ws.Inference.Template.Spec.Containers) > 0 {
-		c := &ws.Inference.Template.Spec.Containers[0]
-		c.Env = append(c.Env, corev1.EnvVar{Name: "LD_LIBRARY_PATH", Value: preExisting})
-	}
-	if err := h.Client().Create(h.Ctx(), ws); err != nil {
-		return fmt.Errorf("creating workspace: %w", err)
-	}
-	defer func() { _ = h.Client().Delete(h.Ctx(), ws) }()
-
-	return h.Poll(6*time.Minute, func() error {
-		sts, err := cache.GetStatefulSet(h, ws)
-		if err != nil {
-			return fmt.Errorf("StatefulSet not created yet: %w", err)
-		}
-		if v := sts.Spec.Template.Labels[InjectLabelKey]; v != InjectLabelValue {
-			return fmt.Errorf("cache not injected yet")
-		}
-		// Actual DACS behavior (verified): the provider appends its own
-		// LD_LIBRARY_PATH env entry rather than merging into an existing one, so
-		// the container ends up with two LD_LIBRARY_PATH entries. Assert both are
-		// present: the user's pre-existing value is retained in the list, and the
-		// injected cache-lib path is added. (At runtime the last entry wins; this
-		// scenario documents that DACS does not merge the two paths.)
-		vals := allContainerEnvValues(&sts.Spec.Template.Spec, "LD_LIBRARY_PATH")
-		if len(vals) == 0 {
-			return fmt.Errorf("LD_LIBRARY_PATH missing after injection")
-		}
-		hasPreExisting := false
-		hasInjected := false
-		for _, v := range vals {
-			if strings.Contains(v, preExisting) {
-				hasPreExisting = true
-			}
-			if strings.Contains(v, ClientMountPath) {
-				hasInjected = true
-			}
-		}
-		if !hasInjected {
-			return fmt.Errorf("injected cache lib path (%s...) not present in any LD_LIBRARY_PATH entry: %v", ClientMountPath, vals)
-		}
-		if !hasPreExisting {
-			return fmt.Errorf("pre-existing LD_LIBRARY_PATH %q was dropped entirely: %v", preExisting, vals)
-		}
-		return nil
-	})
 }
 
 // ---- gated scenarios (real logic, run only when their capability is enabled) ----
@@ -284,23 +216,6 @@ func createCacheNameConfigMap(h cache.E2EHarness, prefix, cacheName string) (*co
 		return nil, fmt.Errorf("creating cacheName ConfigMap: %w", err)
 	}
 	return cm, nil
-}
-
-// allContainerEnvValues returns every value set for the named env var on the
-// first container. Kubernetes does not de-duplicate env entries, so a provider
-// that appends an env var already present yields multiple entries; this helper
-// surfaces all of them.
-func allContainerEnvValues(spec *corev1.PodSpec, name string) []string {
-	if spec == nil || len(spec.Containers) == 0 {
-		return nil
-	}
-	var vals []string
-	for _, e := range spec.Containers[0].Env {
-		if e.Name == name {
-			vals = append(vals, e.Value)
-		}
-	}
-	return vals
 }
 
 // runServingWorkspace creates a cache-enabled workspace, waits for the cache

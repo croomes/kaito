@@ -200,4 +200,9 @@ cache:
       discoveryEndpoint: ""
       kvCacheEnabled: true
       kvConnectorProtocol: "tcp"
+      # OCI image bundling the DACS client libraries (libStorageDirect.so),
+      # mounted into inference pods as an ImageVolume.
+      # glibc requirement: the client is built against glibc 2.35 (manylinux_2_35),
+      # so the inference/base image using the cache MUST be glibc >= 2.35
+      # (Ubuntu 22.04+), otherwise the library fails to load at runtime.
       clientImage: ""

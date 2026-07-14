@@ -16,6 +16,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,28 @@ import (
 	"github.com/kaito-project/kaito/pkg/utils/consts"
 	"github.com/kaito-project/kaito/pkg/utils/generator"
 )
+
+// podTemplateUsesRunaiStreamer reports whether any container in the pod template
+// loads the model via the run:ai streamer (--load-format=runai_streamer or
+// runai_streamer_azure). The DACS cache only takes effect on the streamer's
+// Azure read path; without it the injected env/volume/label are a silent no-op,
+// so cache injection is gated on this being true.
+func podTemplateUsesRunaiStreamer(ss *appsv1.StatefulSet) bool {
+	containers := ss.Spec.Template.Spec.Containers
+	for i := range containers {
+		for _, arg := range containers[i].Command {
+			if strings.Contains(arg, "runai_streamer") {
+				return true
+			}
+		}
+		for _, arg := range containers[i].Args {
+			if strings.Contains(arg, "runai_streamer") {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // SetCacheMutations returns a pod spec modifier that injects cache provider
 // env vars, volumes, volume mounts, and init containers into the inference pod.
@@ -186,11 +209,7 @@ func mergeMutations(dst, src *PodMutations) {
 		existingEnvs[e.Name] = i
 	}
 	for _, e := range src.EnvVars {
-		if idx, exists := existingEnvs[e.Name]; exists {
-			if isPathListEnv(e.Name) {
-				dst.EnvVars[idx].Value = dst.EnvVars[idx].Value + ":" + e.Value
-			}
-		} else {
+		if _, exists := existingEnvs[e.Name]; !exists {
 			dst.EnvVars = append(dst.EnvVars, e)
 			existingEnvs[e.Name] = len(dst.EnvVars) - 1
 		}
@@ -210,20 +229,13 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 
 	container := &spec.Containers[0]
 
-	// Deduplicate env vars. For path-list vars (LD_LIBRARY_PATH, PATH) merge
-	// by appending the new value with a colon separator. For all others, first
-	// wins — existing user values take priority.
+	// Deduplicate env vars. First wins — existing user values take priority.
 	existingEnvs := make(map[string]int, len(container.Env))
 	for i, e := range container.Env {
 		existingEnvs[e.Name] = i
 	}
 	for _, e := range mutations.EnvVars {
-		if idx, exists := existingEnvs[e.Name]; exists {
-			if isPathListEnv(e.Name) {
-				container.Env[idx].Value = container.Env[idx].Value + ":" + e.Value
-			}
-			// else: first wins, skip the mutation value
-		} else {
+		if _, exists := existingEnvs[e.Name]; !exists {
 			container.Env = append(container.Env, e)
 			existingEnvs[e.Name] = len(container.Env) - 1
 		}
@@ -264,13 +276,6 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 			existingInits[c.Name] = struct{}{}
 		}
 	}
-}
-
-// isPathListEnv returns true for environment variables that contain colon-separated
-// path lists. When a user-defined value and a cache mutation both set these, the
-// values are concatenated instead of one winning.
-func isPathListEnv(name string) bool {
-	return name == "LD_LIBRARY_PATH"
 }
 
 // mountCacheConfigMaps merges user-provided Config ConfigMaps with provider Helm
@@ -449,6 +454,16 @@ func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.Works
 // Returns an error when cache mode is Required and mutations cannot be collected.
 func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace, kubeClient client.Client, ss *appsv1.StatefulSet) error {
 	if ws.Cache == nil {
+		return nil
+	}
+
+	// Cache injection only has an effect when the model is loaded via the run:ai
+	// streamer (--load-format=runai_streamer[_azure] + az:// model). For a BYO
+	// template the user controls the load format, so detect it here and skip
+	// injection otherwise to avoid a silent no-op.
+	if !podTemplateUsesRunaiStreamer(ss) {
+		klog.InfoS("cache requested but the pod template does not load the model via runai_streamer; "+
+			"skipping cache injection", "workspace", ws.Name)
 		return nil
 	}
 

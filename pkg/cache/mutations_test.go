@@ -388,6 +388,7 @@ func TestApplyTemplateCacheMutations_AppliesLabelsAndEnvVars(t *testing.T) {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
 						Name: "model",
+						Args: []string{"--load-format=runai_streamer", "--model=az://acct/container/model"},
 						Env:  []corev1.EnvVar{{Name: "EXISTING", Value: "keep"}},
 					}},
 				},
@@ -412,6 +413,79 @@ func TestApplyTemplateCacheMutations_AppliesLabelsAndEnvVars(t *testing.T) {
 	}
 	if envVars["KV_ENV"] != "cache" {
 		t.Fatalf("KV_ENV: got %q", envVars["KV_ENV"])
+	}
+}
+
+// newTemplateSS builds a StatefulSet whose single container optionally loads the
+// model via the run:ai streamer, for exercising the cache-applicability gate.
+func newTemplateSS(usesRunaiStreamer bool) *appsv1.StatefulSet {
+	c := corev1.Container{Name: "model"}
+	if usesRunaiStreamer {
+		c.Args = []string{"--load-format=runai_streamer", "--model=az://acct/container/model"}
+	} else {
+		c.Args = []string{"--load_format=auto", "--model=microsoft/phi-4"}
+	}
+	return &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{c}},
+			},
+		},
+	}
+}
+
+// TestApplyTemplateCacheMutations_SkipsWhenNotRunaiStreamer verifies that a
+// Preferred-mode cache is silently skipped (no label/injection) when the pod
+// template does not load the model via runai_streamer, avoiding a no-op.
+func TestApplyTemplateCacheMutations_SkipsWhenNotRunaiStreamer(t *testing.T) {
+	isolateProviderRegistry(t)
+	provider := &concernTestProvider{name: "concern-test"}
+	Register(provider)
+
+	ws := &kaitov1beta1.Workspace{
+		ObjectMeta: metav1.ObjectMeta{Name: "workspace"},
+		Cache: &kaitov1beta1.CacheSpec{
+			ModelCache: &kaitov1beta1.ModelCacheSpec{
+				Provider: kaitov1beta1.CacheProvider(provider.name),
+				Mode:     kaitov1beta1.CacheModeOpportunistic,
+			},
+		},
+	}
+	ss := newTemplateSS(false)
+
+	if err := ApplyTemplateCacheMutations(context.Background(), ws, nil, ss); err != nil {
+		t.Fatalf("expected no error in Preferred mode, got %v", err)
+	}
+	if len(ss.Spec.Template.Labels) != 0 {
+		t.Fatalf("expected no cache label when template does not use runai_streamer, got %v", ss.Spec.Template.Labels)
+	}
+}
+
+// TestApplyTemplateCacheMutations_SkipsInRequiredMode verifies that a
+// Required-mode cache is also skipped without error when the pod template does
+// not load the model via runai_streamer, since the cache can only engage on the
+// streamer's Azure read path.
+func TestApplyTemplateCacheMutations_SkipsInRequiredMode(t *testing.T) {
+	isolateProviderRegistry(t)
+	provider := &concernTestProvider{name: "concern-test"}
+	Register(provider)
+
+	ws := &kaitov1beta1.Workspace{
+		ObjectMeta: metav1.ObjectMeta{Name: "workspace"},
+		Cache: &kaitov1beta1.CacheSpec{
+			ModelCache: &kaitov1beta1.ModelCacheSpec{
+				Provider: kaitov1beta1.CacheProvider(provider.name),
+				Mode:     kaitov1beta1.CacheModeRequired,
+			},
+		},
+	}
+	ss := newTemplateSS(false)
+
+	if err := ApplyTemplateCacheMutations(context.Background(), ws, nil, ss); err != nil {
+		t.Fatalf("expected no error in Required mode when template does not use runai_streamer, got %v", err)
+	}
+	if len(ss.Spec.Template.Labels) != 0 {
+		t.Fatalf("expected no cache label when template does not use runai_streamer, got %v", ss.Spec.Template.Labels)
 	}
 }
 

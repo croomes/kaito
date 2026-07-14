@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -42,15 +43,10 @@ import (
 const (
 	ProviderName = "dacs"
 
-	// CacheNamespace is the namespace where DACS Cache CRs are managed.
-	CacheNamespace = "dacs-cache-system"
-
-	// DefaultCacheName is the default name for the DACS Cache CR.
-	DefaultCacheName = "cache-sample"
-
-	// Discovery endpoint for DACS cache servers (hostname only, no scheme or port).
-	DefaultDiscoveryEndpoint = DefaultCacheName + "-discovery." + CacheNamespace + ".svc.cluster.local"
-	DefaultDiscoveryPort     = 9065
+	// Fallback defaults used when no DiscoveryEndpoint is configured.
+	defaultCacheNamespace = "dacs-cache-system"
+	defaultCacheName      = "cache-sample"
+	defaultDiscoveryPort  = 9065
 
 	ClientVolumeName = "cache-client"
 	ClientMountPath  = "/opt/cache-client"
@@ -76,6 +72,11 @@ type Config struct {
 
 	// ClientImage is the OCI image containing the DACS client libraries,
 	// mounted as an ImageVolume into inference pods.
+	//
+	// glibc compatibility: the DACS client (libStorageDirect.so) is built and
+	// packaged against glibc 2.35 (manylinux_2_35). The inference/base image
+	// consuming this cache MUST therefore be glibc >= 2.35 (Ubuntu 22.04+),
+	// otherwise the runai streamer will fail to dlopen the library at runtime.
 	ClientImage string
 
 	// KVCacheEnabled controls whether KV caching is supported.
@@ -116,12 +117,60 @@ func New(client dynamic.Interface, cfg Config) *Provider {
 
 func (p *Provider) Name() string { return ProviderName }
 
+// cacheNamespace returns the namespace for Cache CRs.
+// If DiscoveryEndpoint is set (e.g. "cache-sample-discovery.my-ns.svc.cluster.local"),
+// the namespace is extracted from the second DNS label. Otherwise falls back to the default.
+func (p *Provider) cacheNamespace() string {
+	if ep := p.config.DiscoveryEndpoint; ep != "" {
+		if _, ns, ok := parseDiscoveryEndpoint(ep); ok {
+			return ns
+		}
+	}
+	return defaultCacheNamespace
+}
+
+// cacheName returns the default Cache CR name.
+// If DiscoveryEndpoint is set, the name is extracted by stripping the "-discovery"
+// suffix from the first DNS label. Otherwise falls back to the default.
+func (p *Provider) cacheName() string {
+	if ep := p.config.DiscoveryEndpoint; ep != "" {
+		if name, _, ok := parseDiscoveryEndpoint(ep); ok {
+			return name
+		}
+	}
+	return defaultCacheName
+}
+
+// parseDiscoveryEndpoint extracts the cache name and namespace from a discovery
+// endpoint of the form "<name>-discovery.<namespace>.svc.cluster.local[:port]".
+// Returns (cacheName, namespace, true) on success.
+func parseDiscoveryEndpoint(endpoint string) (string, string, bool) {
+	// Strip port if present.
+	host := endpoint
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	parts := strings.SplitN(host, ".", 3)
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	svcName := parts[0]
+	ns := parts[1]
+	name := strings.TrimSuffix(svcName, "-discovery")
+	if name == svcName {
+		// No "-discovery" suffix found; can't extract cache name.
+		return "", "", false
+	}
+	return name, ns, true
+}
+
 // IsAvailable checks if the DACS Cache CRD is installed in the cluster.
 // If cacheName is provided, checks that specific CR exists; otherwise tries
-// DefaultCacheName, then falls back to single-CR auto-detection.
+// the default cache name, then falls back to single-CR auto-detection.
 func (p *Provider) IsAvailable(ctx context.Context, cacheName string) (bool, error) {
+	ns := p.cacheNamespace()
 	if cacheName != "" {
-		_, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).Get(ctx, cacheName, metav1.GetOptions{})
+		_, err := p.client.Resource(cacheGVR).Namespace(ns).Get(ctx, cacheName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
 				return false, nil
@@ -132,16 +181,17 @@ func (p *Provider) IsAvailable(ctx context.Context, cacheName string) (bool, err
 	}
 
 	// Try default cache name first.
-	_, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).Get(ctx, DefaultCacheName, metav1.GetOptions{})
+	defName := p.cacheName()
+	_, err := p.client.Resource(cacheGVR).Namespace(ns).Get(ctx, defName, metav1.GetOptions{})
 	if err == nil {
 		return true, nil
 	}
 	if !errors.IsNotFound(err) {
-		return false, fmt.Errorf("checking DACS cache %q: %w", DefaultCacheName, err)
+		return false, fmt.Errorf("checking DACS cache %q: %w", defName, err)
 	}
 
 	// Default not found — list to see what exists.
-	caches, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).List(ctx, metav1.ListOptions{})
+	caches, err := p.client.Resource(cacheGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
@@ -157,16 +207,17 @@ func (p *Provider) IsAvailable(ctx context.Context, cacheName string) (bool, err
 	default:
 		return false, fmt.Errorf("multiple DACS cache clusters found (%d) but no default %q; "+
 			"specify cacheName in the Config ConfigMap via InferenceSet or Workspace CR",
-			len(caches.Items), DefaultCacheName)
+			len(caches.Items), defName)
 	}
 }
 
 // IsReady checks cache readiness. If cacheName is provided, checks that specific
-// CR. Otherwise tries DefaultCacheName; if absent, auto-detects a single CR.
+// CR. Otherwise tries the default cache name; if absent, auto-detects a single CR.
 // Returns error if multiple CRs exist without a default or explicit cacheName.
 func (p *Provider) IsReady(ctx context.Context, cacheName string) (bool, string, error) {
+	ns := p.cacheNamespace()
 	if cacheName != "" {
-		cacheObj, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).Get(ctx, cacheName, metav1.GetOptions{})
+		cacheObj, err := p.client.Resource(cacheGVR).Namespace(ns).Get(ctx, cacheName, metav1.GetOptions{})
 		if err != nil {
 			return false, "", fmt.Errorf("getting DACS cache %q: %w", cacheName, err)
 		}
@@ -175,18 +226,19 @@ func (p *Provider) IsReady(ctx context.Context, cacheName string) (bool, string,
 	}
 
 	// Try default cache name first.
-	cacheObj, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).Get(ctx, DefaultCacheName, metav1.GetOptions{})
+	defName := p.cacheName()
+	cacheObj, err := p.client.Resource(cacheGVR).Namespace(ns).Get(ctx, defName, metav1.GetOptions{})
 	if err == nil {
 		p.cacheObj = cacheObj
 		ready, reason := checkCacheReady(cacheObj)
 		return ready, reason, nil
 	}
 	if !errors.IsNotFound(err) {
-		return false, "", fmt.Errorf("getting DACS cache %q: %w", DefaultCacheName, err)
+		return false, "", fmt.Errorf("getting DACS cache %q: %w", defName, err)
 	}
 
 	// Default not found — list to auto-detect.
-	caches, err := p.client.Resource(cacheGVR).Namespace(CacheNamespace).List(ctx, metav1.ListOptions{})
+	caches, err := p.client.Resource(cacheGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false, "", fmt.Errorf("listing DACS caches: %w", err)
 	}
@@ -201,7 +253,7 @@ func (p *Provider) IsReady(ctx context.Context, cacheName string) (bool, string,
 	default:
 		return false, "", fmt.Errorf("multiple DACS cache clusters found (%d) but no default %q; "+
 			"specify cacheName in the Config ConfigMap via InferenceSet or Workspace CR",
-			len(caches.Items), DefaultCacheName)
+			len(caches.Items), defName)
 	}
 }
 
@@ -270,10 +322,9 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 		mutations.EnvVars = append(mutations.EnvVars,
 			corev1.EnvVar{Name: "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED", Value: "true"},
 			corev1.EnvVar{Name: "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_LIB", Value: ClientLibPath},
-			corev1.EnvVar{Name: "LD_LIBRARY_PATH", Value: ClientMountPath + "/usr/lib/x86_64-linux-gnu:" + ClientMountPath + "/usr/local/lib/python3.10/dist-packages/dacs_client"},
 			corev1.EnvVar{Name: "RUNAI_STREAMER_CACHE_ENABLED", Value: "true"},
 			corev1.EnvVar{Name: "CACHE_DISCOVERY_URL", Value: discoveryEndpoint},
-			corev1.EnvVar{Name: "CACHE_SERVER_PORT", Value: fmt.Sprintf("%d", DefaultDiscoveryPort)},
+			corev1.EnvVar{Name: "CACHE_SERVER_PORT", Value: fmt.Sprintf("%d", defaultDiscoveryPort)},
 		)
 
 	case cache.CacheConcernKVCache:
@@ -299,23 +350,26 @@ func (p *Provider) PodMutations(ctx context.Context, concern cache.CacheConcern,
 }
 
 // resolveDiscoveryEndpoint returns the discovery endpoint for a given cache.
-// Priority: explicit config > provided cacheName > default cacheObj name > DefaultDiscoveryEndpoint.
+// Priority: explicit config > provided cacheName > default cacheObj name > derived default.
 func (p *Provider) resolveDiscoveryEndpoint(cacheName string) string {
 	if p.config.DiscoveryEndpoint != "" {
 		return p.config.DiscoveryEndpoint
 	}
 
+	ns := p.cacheNamespace()
+
 	// Use provided cacheName (from user ConfigMap).
 	if cacheName != "" {
-		return fmt.Sprintf("%s-discovery.%s.svc.cluster.local", cacheName, CacheNamespace)
+		return fmt.Sprintf("%s-discovery.%s.svc.cluster.local", cacheName, ns)
 	}
 
 	// Fall back to the default cacheObj discovered by IsReady.
 	if p.cacheObj != nil {
-		return fmt.Sprintf("%s-discovery.%s.svc.cluster.local", p.cacheObj.GetName(), CacheNamespace)
+		return fmt.Sprintf("%s-discovery.%s.svc.cluster.local", p.cacheObj.GetName(), ns)
 	}
 
-	return DefaultDiscoveryEndpoint
+	defName := p.cacheName()
+	return fmt.Sprintf("%s-discovery.%s.svc.cluster.local", defName, ns)
 }
 
 // Cleanup is a placeholder for cache invalidation logic.
