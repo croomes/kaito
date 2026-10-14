@@ -69,7 +69,7 @@ type MutationExpectation struct {
 type Expectations struct {
 	// Provider is the provider name these expectations apply to. Must match the
 	// value returned by Provider.Name().
-	Provider kaitov1beta1.CacheProvider
+	Provider ProviderName
 
 	// NewForConformance returns a Provider instance suitable for offline (no live
 	// cluster) mutation conformance. It must not require a reachable cache backend,
@@ -132,7 +132,7 @@ type E2EWorkspaceConfig struct {
 	// Customizer fills in the provider's runtime specifics on the skeleton
 	// workspace the shared specs build (serving image, vLLM args, backend env,
 	// etc.). The specs own the provider-neutral scaffolding (metadata, resource
-	// selector, cache spec, service account); the provider owns everything the
+	// selector, cache attachment, service account); the provider owns everything the
 	// cache backend requires to engage. Must not be nil when SkipReason is empty.
 	Customizer func(ws *kaitov1beta1.Workspace)
 }
@@ -187,7 +187,7 @@ func (e Expectations) ForConcern(concern CacheConcern) MutationExpectation {
 
 var (
 	expMu        sync.RWMutex
-	expectations = map[kaitov1beta1.CacheProvider]Expectations{}
+	expectations = map[ProviderName]Expectations{}
 )
 
 // RegisterExpectations records a provider's conformance contract. It should be
@@ -200,7 +200,7 @@ func RegisterExpectations(e Expectations) {
 }
 
 // GetExpectations returns the registered expectations for a provider.
-func GetExpectations(name kaitov1beta1.CacheProvider) (Expectations, bool) {
+func GetExpectations(name ProviderName) (Expectations, bool) {
 	expMu.RLock()
 	defer expMu.RUnlock()
 	e, ok := expectations[name]

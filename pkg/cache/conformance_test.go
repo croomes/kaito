@@ -59,7 +59,7 @@ func TestProviderConformance_AutoDiscovered(t *testing.T) {
 			if p == nil {
 				t.Fatalf("provider %q NewForConformance returned nil", e.Provider)
 			}
-			if got := kaitov1beta1.CacheProvider(p.Name()); got != e.Provider {
+			if got := cache.ProviderName(p.Name()); got != e.Provider {
 				t.Fatalf("provider name mismatch: instance %q, expectations %q", got, e.Provider)
 			}
 
@@ -73,7 +73,7 @@ func TestProviderConformance_AutoDiscovered(t *testing.T) {
 					continue
 				}
 				t.Run(string(concern), func(t *testing.T) {
-					m, err := p.PodMutations(context.Background(), concern, ws, "test-model", "main", "")
+					m, err := p.PodMutations(context.Background(), concern, ws, "test-model", "main", nil)
 					if err != nil {
 						t.Fatalf("PodMutations(%s) returned error: %v", concern, err)
 					}
@@ -98,7 +98,7 @@ func TestProviderConformance_AutoDiscovered(t *testing.T) {
 // the global provider registry is shared across the test binary and is deliberately
 // polluted with fake providers by other unit tests in this package.
 func TestProviderConformance_ShippedProviders(t *testing.T) {
-	shipped := []kaitov1beta1.CacheProvider{"noop", "dacs"}
+	shipped := []cache.ProviderName{"noop", "dacs"}
 	for _, name := range shipped {
 		e, ok := cache.GetExpectations(name)
 		if !ok {
@@ -109,7 +109,7 @@ func TestProviderConformance_ShippedProviders(t *testing.T) {
 			t.Errorf("shipped provider %q has no NewForConformance factory", name)
 			continue
 		}
-		if got := kaitov1beta1.CacheProvider(e.NewForConformance().Name()); got != name {
+		if got := cache.ProviderName(e.NewForConformance().Name()); got != name {
 			t.Errorf("provider %q factory produced instance named %q", name, got)
 		}
 	}
@@ -144,7 +144,7 @@ func TestAllProviderDirectoriesRegisterExpectations(t *testing.T) {
 			continue
 		}
 
-		provider := kaitov1beta1.CacheProvider(dir)
+		provider := cache.ProviderName(dir)
 		exp, ok := cache.GetExpectations(provider)
 		if !ok {
 			t.Errorf("provider directory %q exists under pkg/cache/ but did not register "+

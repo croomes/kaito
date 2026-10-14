@@ -36,7 +36,7 @@ import (
 // supply two things:
 //
 //  1. A mock cache.Provider implementing the core interface (Name, IsAvailable,
-//     IsReady, PodMutations, Cleanup) that faithfully reproduces the provider's
+//     IsReady, PodMutations) that faithfully reproduces the provider's
 //     real pod-mutation surface: the injection label(s) and env vars it adds for
 //     each CacheConcern (ModelWeights and/or KVCache). The mock is the contract
 //     stand-in, so keep its output in lockstep with the production provider.
@@ -67,7 +67,7 @@ func (p *dacsTestProvider) IsAvailable(_ context.Context, _ string) (bool, error
 func (p *dacsTestProvider) IsReady(_ context.Context, _ string) (bool, string, error) {
 	return true, "ready", nil
 }
-func (p *dacsTestProvider) PodMutations(_ context.Context, concern CacheConcern, ws *kaitov1beta1.Workspace, modelName, modelRevision, _ string) (*PodMutations, error) {
+func (p *dacsTestProvider) PodMutations(_ context.Context, concern CacheConcern, ws *kaitov1beta1.Workspace, modelName, modelRevision string, _ map[string]string) (*PodMutations, error) {
 	mutations := &PodMutations{}
 
 	switch concern {
@@ -95,10 +95,6 @@ func (p *dacsTestProvider) PodMutations(_ context.Context, concern CacheConcern,
 	}
 
 	return mutations, nil
-}
-
-func (p *dacsTestProvider) Cleanup(_ context.Context, _ *kaitov1beta1.Workspace, _ string) error {
-	return nil
 }
 
 // cacheProviderFixture couples a mock cache Provider with the observable
@@ -131,7 +127,7 @@ func dacsFixture() cacheProviderFixture {
 	return cacheProviderFixture{
 		provider: p,
 		expectations: Expectations{
-			Provider: kaitov1beta1.CacheProvider(p.Name()),
+			Provider: ProviderName(p.Name()),
 			ModelWeights: MutationExpectation{
 				Supported:      true,
 				RequiredLabels: injectLabel,
@@ -149,7 +145,7 @@ func dacsFixture() cacheProviderFixture {
 }
 
 // name returns the provider identifier used in Workspace specs.
-func (f cacheProviderFixture) name() kaitov1beta1.CacheProvider {
+func (f cacheProviderFixture) name() ProviderName {
 	return f.expectations.Provider
 }
 
@@ -204,31 +200,25 @@ func (m *mockModel) SupportDistributedInference() bool          { return false }
 func (m *mockModel) SupportTuning() bool                        { return false }
 
 // modelWeightsWorkspace builds a Workspace whose only cache concern is model weights.
-func modelWeightsWorkspace(provider kaitov1beta1.CacheProvider, mode kaitov1beta1.CacheMode) *kaitov1beta1.Workspace {
-	return &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelCache: &kaitov1beta1.ModelCacheSpec{Provider: provider, Mode: mode},
-		},
-	}
+func modelWeightsWorkspace(provider ProviderName, mode Mode) *kaitov1beta1.Workspace {
+	return workspaceWithTestAttachment(&Attachment{
+		ModelWeights: &ConcernConfig{Provider: provider, Mode: mode},
+	})
 }
 
 // kvCacheWorkspace builds a Workspace whose only cache concern is KV cache.
-func kvCacheWorkspace(provider kaitov1beta1.CacheProvider, mode kaitov1beta1.CacheMode) *kaitov1beta1.Workspace {
-	return &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			KVCache: &kaitov1beta1.KVCacheSpec{Provider: provider, Mode: mode},
-		},
-	}
+func kvCacheWorkspace(provider ProviderName, mode Mode) *kaitov1beta1.Workspace {
+	return workspaceWithTestAttachment(&Attachment{
+		KVCache: &ConcernConfig{Provider: provider, Mode: mode},
+	})
 }
 
 // bothConcernsWorkspace builds a Workspace that enables both cache concerns.
-func bothConcernsWorkspace(provider kaitov1beta1.CacheProvider, mwMode, kvMode kaitov1beta1.CacheMode) *kaitov1beta1.Workspace {
-	return &kaitov1beta1.Workspace{
-		Cache: &kaitov1beta1.CacheSpec{
-			ModelCache: &kaitov1beta1.ModelCacheSpec{Provider: provider, Mode: mwMode},
-			KVCache:    &kaitov1beta1.KVCacheSpec{Provider: provider, Mode: kvMode},
-		},
-	}
+func bothConcernsWorkspace(provider ProviderName, mwMode, kvMode Mode) *kaitov1beta1.Workspace {
+	return workspaceWithTestAttachment(&Attachment{
+		ModelWeights: &ConcernConfig{Provider: provider, Mode: mwMode},
+		KVCache:      &ConcernConfig{Provider: provider, Mode: kvMode},
+	})
 }
 
 // TestSetCacheMutations_FullPipeline tests the complete mutation pipeline
@@ -247,23 +237,23 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 			}{
 				{
 					name:         "model weights only - label + streamer env vars",
-					workspace:    modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeOpportunistic),
+					workspace:    modelWeightsWorkspace(f.name(), ModeOpportunistic),
 					modelWeights: true,
 				},
 				{
 					name:      "KV cache only - KV config env var",
-					workspace: kvCacheWorkspace(f.name(), kaitov1beta1.CacheModeRequired),
+					workspace: kvCacheWorkspace(f.name(), ModeRequired),
 					kvCache:   true,
 				},
 				{
 					name:         "both model weights and KV cache",
-					workspace:    bothConcernsWorkspace(f.name(), kaitov1beta1.CacheModeOpportunistic, kaitov1beta1.CacheModeRequired),
+					workspace:    bothConcernsWorkspace(f.name(), ModeOpportunistic, ModeRequired),
 					modelWeights: true,
 					kvCache:      true,
 				},
 				{
 					name:      "disabled mode - no mutations",
-					workspace: modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeDisabled),
+					workspace: modelWeightsWorkspace(f.name(), ModeDisabled),
 				},
 				{
 					name:      "nil cache - no mutations",
@@ -282,6 +272,9 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 						Ctx:       context.Background(),
 						Workspace: tt.workspace,
 						Model:     &mockModel{name: "microsoft/phi-4"},
+					}
+					if HasAttachment(tt.workspace) {
+						ctx.KubeClient = attachmentClientForWorkspace(t, tt.workspace)
 					}
 
 					spec := &corev1.PodSpec{
@@ -345,7 +338,7 @@ func TestSetCacheMutations_ModelWeightsEnvVars(t *testing.T) {
 		f.register()
 
 		t.Run(string(f.name()), func(t *testing.T) {
-			ws := modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeOpportunistic)
+			ws := modelWeightsWorkspace(f.name(), ModeOpportunistic)
 			ws.Inference = &kaitov1beta1.InferenceSpec{
 				Preset: &kaitov1beta1.PresetSpec{
 					PresetMeta: kaitov1beta1.PresetMeta{Name: "microsoft/phi-4"},
@@ -353,9 +346,10 @@ func TestSetCacheMutations_ModelWeightsEnvVars(t *testing.T) {
 			}
 
 			ctx := &generator.WorkspaceGeneratorContext{
-				Ctx:       context.Background(),
-				Workspace: ws,
-				Model:     &mockModel{name: "microsoft/phi-4"},
+				Ctx:        context.Background(),
+				Workspace:  ws,
+				Model:      &mockModel{name: "microsoft/phi-4"},
+				KubeClient: attachmentClientForWorkspace(t, ws),
 			}
 			spec := &corev1.PodSpec{
 				Containers: []corev1.Container{{Name: "model"}},
@@ -389,7 +383,7 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 		f.register()
 
 		t.Run(string(f.name()), func(t *testing.T) {
-			ws := modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeRequired)
+			ws := modelWeightsWorkspace(f.name(), ModeRequired)
 			ws.Inference = &kaitov1beta1.InferenceSpec{
 				Preset: &kaitov1beta1.PresetSpec{
 					PresetMeta: kaitov1beta1.PresetMeta{Name: "microsoft/phi-4"},
@@ -397,9 +391,10 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 			}
 
 			ctx := &generator.WorkspaceGeneratorContext{
-				Ctx:       context.Background(),
-				Workspace: ws,
-				Model:     &mockModel{name: "microsoft/phi-4"},
+				Ctx:        context.Background(),
+				Workspace:  ws,
+				Model:      &mockModel{name: "microsoft/phi-4"},
+				KubeClient: attachmentClientForWorkspace(t, ws),
 			}
 
 			// Pod spec with pre-existing volumes, mounts, env vars, and init containers.
@@ -486,13 +481,13 @@ func TestSetCachePodTemplateLabels(t *testing.T) {
 			}{
 				{
 					name:        "model weights enabled - label added",
-					workspace:   modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeOpportunistic),
+					workspace:   modelWeightsWorkspace(f.name(), ModeOpportunistic),
 					concern:     CacheConcernModelWeights,
 					expectLabel: true,
 				},
 				{
 					name:        "KV cache enabled - label added",
-					workspace:   kvCacheWorkspace(f.name(), kaitov1beta1.CacheModeRequired),
+					workspace:   kvCacheWorkspace(f.name(), ModeRequired),
 					concern:     CacheConcernKVCache,
 					expectLabel: true,
 				},
@@ -503,7 +498,7 @@ func TestSetCachePodTemplateLabels(t *testing.T) {
 				},
 				{
 					name:        "disabled mode - no label",
-					workspace:   modelWeightsWorkspace(f.name(), kaitov1beta1.CacheModeDisabled),
+					workspace:   modelWeightsWorkspace(f.name(), ModeDisabled),
 					concern:     CacheConcernModelWeights,
 					expectLabel: false,
 				},
@@ -517,10 +512,11 @@ func TestSetCachePodTemplateLabels(t *testing.T) {
 						Model:     &mockModel{name: "microsoft/phi-4"},
 					}
 
-					if tt.workspace.Cache == nil {
+					if !HasAttachment(tt.workspace) {
 						return
 					}
-					mutations, err := collectMutations(ctx.Ctx, nil, tt.workspace, "microsoft/phi-4", "main", nil)
+					attachment := attachmentForTestWorkspace(t, tt.workspace)
+					mutations, err := collectMutations(ctx.Ctx, tt.workspace, attachment, "microsoft/phi-4", "main", nil)
 					if err != nil {
 						t.Fatalf("unexpected error: %v", err)
 					}
