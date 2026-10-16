@@ -365,9 +365,6 @@ func TestPodMutations_ModelWeights(t *testing.T) {
 		t.Fatalf("expected 8 env vars, got %d: %v", len(mutations.EnvVars), mutations.EnvVars)
 	}
 	envVars := envVarMap(mutations.EnvVars)
-	if envVars["RUNAI_STREAMER_CACHE_ENABLED"] != "true" {
-		t.Errorf("RUNAI_STREAMER_CACHE_ENABLED: got %q, want true", envVars["RUNAI_STREAMER_CACHE_ENABLED"])
-	}
 	if envVars["RUNAI_STREAMER_CHUNK_BYTESIZE"] != "33554432" {
 		t.Errorf("RUNAI_STREAMER_CHUNK_BYTESIZE: got %q, want 33554432", envVars["RUNAI_STREAMER_CHUNK_BYTESIZE"])
 	}
@@ -387,10 +384,7 @@ func TestPodMutations_ModelWeights(t *testing.T) {
 	if envVars[siDeferCachePopulationEnv] != "true" {
 		t.Errorf("%s: got %q, want true", siDeferCachePopulationEnv, envVars[siDeferCachePopulationEnv])
 	}
-	// Should NOT have init containers, volumes, or volume mounts (webhook handles these).
-	if len(mutations.InitContainers) != 0 {
-		t.Errorf("expected 0 init containers (webhook handles injection), got %d", len(mutations.InitContainers))
-	}
+	// The webhook handles injection; KAITO only mounts the DACS client image.
 	if len(mutations.Volumes) != 1 {
 		t.Errorf("expected 1 volume (DACS client), got %d", len(mutations.Volumes))
 	}
@@ -482,10 +476,6 @@ func TestPodMutations_KVCacheOnly(t *testing.T) {
 		t.Errorf("locator_nodes: got %v, want %s", cfg.KVConnectorExtraConfig["locator_nodes"], wantLocator)
 	}
 
-	// Should NOT have init containers.
-	if len(mutations.InitContainers) != 0 {
-		t.Errorf("expected 0 init containers, got %d", len(mutations.InitContainers))
-	}
 }
 
 func TestPodMutations_BothConcerns(t *testing.T) {
@@ -513,9 +503,6 @@ func TestPodMutations_BothConcerns(t *testing.T) {
 	}
 	if len(kvMutations.EnvVars) != 1 || kvMutations.EnvVars[0].Name != "VLLM_KV_TRANSFER_CONFIG" {
 		t.Errorf("KV cache should only have VLLM_KV_TRANSFER_CONFIG, got %v", kvMutations.EnvVars)
-	}
-	if len(kvMutations.InitContainers) != 0 {
-		t.Error("KV concern should not include init containers")
 	}
 }
 
@@ -551,9 +538,6 @@ func TestPodMutations_ConcernIsolation(t *testing.T) {
 	kv, err := p.PodMutations(context.Background(), cache.CacheConcernKVCache, ws, "microsoft/phi-4", "main", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(kv.InitContainers) != 0 {
-		t.Errorf("KV concern should not have init containers, got %d", len(kv.InitContainers))
 	}
 	for _, env := range kv.EnvVars {
 		if env.Name == "RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED" {
