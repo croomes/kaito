@@ -54,8 +54,6 @@ type PodMutations struct {
 	Volumes []corev1.Volume
 	// VolumeMounts to add to model containers.
 	VolumeMounts []corev1.VolumeMount
-	// InitContainers to prepend to the pod.
-	InitContainers []corev1.Container
 }
 
 // Provider defines the interface that cache implementations must satisfy.

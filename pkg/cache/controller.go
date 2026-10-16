@@ -24,7 +24,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -45,8 +45,7 @@ type ProviderStatus struct {
 	LastCheck time.Time
 }
 
-// Controller is the Cache Controller that manages provider lifecycle,
-// monitors readiness, and watches node topology for cache infrastructure.
+// Controller monitors cache provider availability and readiness.
 type Controller struct {
 	client.Client
 	Recorder record.EventRecorder
@@ -64,9 +63,8 @@ func NewController(c client.Client, recorder record.EventRecorder) *Controller {
 	}
 }
 
-// Reconcile is triggered by Node events and periodic requeue. It checks
-// all registered providers for availability and readiness, emitting events
-// on state transitions.
+// Reconcile checks all registered providers for availability and readiness,
+// emitting events on state transitions.
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	klog.V(4).InfoS("Cache controller reconcile", "trigger", req.NamespacedName)
 
@@ -150,14 +148,24 @@ func (c *Controller) GetProviderStatus(name ProviderName) *ProviderStatus {
 	return c.getStatus(name)
 }
 
-// SetupWithManager registers the Cache Controller with the manager.
-// It watches Nodes to detect topology changes that affect cache scheduling.
+// SetupWithManager registers periodic provider readiness monitoring.
 func (c *Controller) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("cache").
-		Watches(&corev1.Node{}, &nodeEventHandler{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(c)
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		ticker := time.NewTicker(ReadinessCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			if _, err := c.Reconcile(ctx, reconcile.Request{}); err != nil {
+				klog.ErrorS(err, "Cache provider readiness check failed")
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	}))
 }
 
 func (c *Controller) getStatus(name ProviderName) *ProviderStatus {

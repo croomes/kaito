@@ -51,9 +51,6 @@ func AssertMutations(m *PodMutations, exp MutationExpectation) []error {
 		if len(m.VolumeMounts) != 0 {
 			errs = append(errs, fmt.Errorf("expected no volume mounts, got %d", len(m.VolumeMounts)))
 		}
-		if len(m.InitContainers) != 0 {
-			errs = append(errs, fmt.Errorf("expected no init containers, got %d", len(m.InitContainers)))
-		}
 		return errs
 	}
 

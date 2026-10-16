@@ -48,7 +48,6 @@ import (
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/cache"
-	cachenoop "github.com/kaito-project/kaito/pkg/cache/noop"
 	autoupgrade "github.com/kaito-project/kaito/pkg/controllers/autoupgrade"
 	drift "github.com/kaito-project/kaito/pkg/controllers/drift"
 	multiroleinference "github.com/kaito-project/kaito/pkg/controllers/multiroleinference"
@@ -222,10 +221,6 @@ func main() {
 	cfg.UserAgent = workspaceController
 	setRestConfig(cfg, kubeClientQPS, kubeClientBurst)
 
-	// Register built-in cache providers. External providers register themselves
-	// via their own init()/blank import and the cache.Register() hook.
-	cache.Register(cachenoop.NewProvider())
-
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -331,7 +326,7 @@ func main() {
 		exitWithErrorFunc()
 	}
 
-	// Cache controller — monitors provider readiness and node topology.
+	// Cache controller — monitors provider readiness.
 	if featuregates.FeatureGates[consts.FeatureFlagDistributedCache] {
 		cacheController := cache.NewController(kClient, mgr.GetEventRecorderFor("KAITO-Cache-controller"))
 		if err = cacheController.SetupWithManager(mgr); err != nil {

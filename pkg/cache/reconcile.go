@@ -155,9 +155,9 @@ func conditionIsTrue(status *kaitov1beta1.WorkspaceStatus, condType kaitov1beta1
 }
 
 // concernInjected reports whether the provider's mutations for a concern are
-// actually present on the rendered pod template. It recomputes the concern's
-// mutations via the same render-time path (collectMutations) so the two cannot
-// disagree, and confirms any provider-declared labels landed on the workload.
+// actually present on the rendered pod template. It recomputes model-independent
+// mutations through collectMutations and confirms any provider-declared labels
+// landed on the workload.
 func concernInjected(ctx context.Context, ws *kaitov1beta1.Workspace,
 	attachment *Attachment, concern CacheConcern, ss *appsv1.StatefulSet) (bool, string) {
 
@@ -166,13 +166,15 @@ func concernInjected(ctx context.Context, ws *kaitov1beta1.Workspace,
 	}
 
 	// Evaluate this concern in isolation so we can attribute the result to the
-	// correct condition, reusing the exact render-time collectMutations path.
+	// correct condition. Model identity is intentionally omitted: changing the
+	// model name or revision rolls the workload, so injection verification must
+	// only depend on provider mutations that are stable across model revisions.
 	m, err := collectMutations(ctx, ws, singleConcernAttachment(attachment, concern), "", "", ss)
 	if err != nil {
 		return false, fmt.Sprintf("cache not injected: %v", err)
 	}
 	if m == nil || (len(m.Labels) == 0 && len(m.EnvVars) == 0 && len(m.Volumes) == 0 &&
-		len(m.VolumeMounts) == 0 && len(m.InitContainers) == 0) {
+		len(m.VolumeMounts) == 0) {
 		return false, "cache configured but not injected into inference pod " +
 			"(provider not applicable to this workload or infrastructure unavailable)"
 	}

@@ -16,6 +16,9 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
+	"regexp"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +29,29 @@ import (
 	"github.com/kaito-project/kaito/pkg/utils"
 	"github.com/kaito-project/kaito/pkg/utils/generator"
 )
+
+const (
+	defaultCacheContainerImages = "kaito-base"
+	cacheContainerImageRegexEnv = "CACHE_CONTAINER_IMAGE_REGEX"
+)
+
+func isCacheContainer(image string) bool {
+	if pattern := os.Getenv(cacheContainerImageRegexEnv); pattern != "" {
+		matched, err := regexp.MatchString(pattern, image)
+		if err != nil {
+			klog.ErrorS(err, "Invalid cache container image regex", "pattern", pattern)
+			return false
+		}
+		return matched
+	}
+
+	for _, value := range strings.Split(defaultCacheContainerImages, ",") {
+		if strings.Contains(image, strings.TrimSpace(value)) {
+			return true
+		}
+	}
+	return false
+}
 
 // providerAppliesTo consults a provider's optional PodApplicabilityChecker to
 // decide whether its mutations should be injected into the given workload.
@@ -40,7 +66,7 @@ func providerAppliesTo(p Provider, concern CacheConcern, ws *kaitov1beta1.Worksp
 }
 
 // SetCacheMutations returns a pod spec modifier that injects cache provider
-// env vars, volumes, volume mounts, and init containers into the inference pod.
+// env vars, volumes, and volume mounts into the inference pod.
 // Returns nil (no modifier) when cache is not configured. Callers are expected
 // to gate on the distributed-cache feature flag before wiring this modifier in.
 func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, corev1.PodSpec] {
@@ -52,6 +78,9 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 		attachment, err := ResolveEffectiveAttachment(ctx.Ctx, ctx.KubeClient, ws)
 		if err != nil {
 			return fmt.Errorf("resolving cache attachment: %w", err)
+		}
+		if attachment == nil {
+			return nil
 		}
 
 		// Extract model name and revision from the model's metadata.
@@ -85,8 +114,7 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 			"labels", mutations.Labels,
 			"envVars", len(mutations.EnvVars),
 			"volumes", len(mutations.Volumes),
-			"volumeMounts", len(mutations.VolumeMounts),
-			"initContainers", len(mutations.InitContainers))
+			"volumeMounts", len(mutations.VolumeMounts))
 		for _, env := range mutations.EnvVars {
 			klog.V(4).InfoS("  cache env var", "name", env.Name, "value", env.Value)
 		}
@@ -213,7 +241,6 @@ func mergeMutations(dst, src *PodMutations) {
 
 	dst.Volumes = append(dst.Volumes, src.Volumes...)
 	dst.VolumeMounts = append(dst.VolumeMounts, src.VolumeMounts...)
-	dst.InitContainers = append(dst.InitContainers, src.InitContainers...)
 }
 
 // applyMutations injects the collected mutations into the pod spec.
@@ -223,30 +250,41 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 		return
 	}
 
-	container := &spec.Containers[0]
-
-	// Deduplicate env vars. First wins — existing user values take priority.
-	existingEnvs := make(map[string]int, len(container.Env))
-	for i, e := range container.Env {
-		existingEnvs[e.Name] = i
-	}
-	for _, e := range mutations.EnvVars {
-		if _, exists := existingEnvs[e.Name]; !exists {
-			container.Env = append(container.Env, e)
-			existingEnvs[e.Name] = len(container.Env) - 1
+	matched := false
+	for i := range spec.Containers {
+		container := &spec.Containers[i]
+		if !isCacheContainer(container.Image) {
+			continue
 		}
-	}
+		matched = true
 
-	// Deduplicate volume mounts by name (first wins).
-	existingMounts := make(map[string]struct{}, len(container.VolumeMounts))
-	for _, m := range container.VolumeMounts {
-		existingMounts[m.Name] = struct{}{}
-	}
-	for _, m := range mutations.VolumeMounts {
-		if _, exists := existingMounts[m.Name]; !exists {
-			container.VolumeMounts = append(container.VolumeMounts, m)
+		// Deduplicate env vars. First wins — existing user values take priority.
+		existingEnvs := make(map[string]int, len(container.Env))
+		for i, e := range container.Env {
+			existingEnvs[e.Name] = i
+		}
+		for _, e := range mutations.EnvVars {
+			if _, exists := existingEnvs[e.Name]; !exists {
+				container.Env = append(container.Env, e)
+				existingEnvs[e.Name] = len(container.Env) - 1
+			}
+		}
+
+		// Deduplicate volume mounts by name (first wins).
+		existingMounts := make(map[string]struct{}, len(container.VolumeMounts))
+		for _, m := range container.VolumeMounts {
 			existingMounts[m.Name] = struct{}{}
 		}
+		for _, m := range mutations.VolumeMounts {
+			if _, exists := existingMounts[m.Name]; !exists {
+				container.VolumeMounts = append(container.VolumeMounts, m)
+				existingMounts[m.Name] = struct{}{}
+			}
+		}
+	}
+
+	if !matched {
+		return
 	}
 
 	// Deduplicate volumes by name (first wins).
@@ -261,17 +299,6 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 		}
 	}
 
-	// Deduplicate init containers by name (first wins).
-	existingInits := make(map[string]struct{}, len(spec.InitContainers))
-	for _, c := range spec.InitContainers {
-		existingInits[c.Name] = struct{}{}
-	}
-	for _, c := range mutations.InitContainers {
-		if _, exists := existingInits[c.Name]; !exists {
-			spec.InitContainers = append(spec.InitContainers, c)
-			existingInits[c.Name] = struct{}{}
-		}
-	}
 }
 
 // mountAttachmentParameters merges attachment parameters with provider defaults,
@@ -395,6 +422,9 @@ func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.Works
 		if err != nil {
 			return fmt.Errorf("resolving cache attachment: %w", err)
 		}
+		if attachment == nil {
+			return nil
+		}
 
 		var modelName, modelRevision string
 		if ctx.Model != nil {
@@ -449,6 +479,9 @@ func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace
 	attachment, err := ResolveEffectiveAttachment(ctx, kubeClient, ws)
 	if err != nil {
 		return fmt.Errorf("resolving cache attachment: %w", err)
+	}
+	if attachment == nil {
+		return nil
 	}
 
 	mutations, err := collectMutations(ctx, ws, attachment, "", "", ss)
@@ -517,7 +550,7 @@ func mapsEqual(a, b map[string]string) bool {
 		return false
 	}
 	for k, v := range a {
-		if b[k] != v {
+		if other, exists := b[k]; !exists || other != v {
 			return false
 		}
 	}

@@ -184,7 +184,7 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "vllm",
-						Image:   "kaito-vllm:latest",
+						Image:   "kaito-base:latest",
 						Command: []string{"python3", "/workspace/vllm/inference_api.py"},
 						Env:     []corev1.EnvVar{{Name: "EXISTING_VAR", Value: "keep"}},
 					},
@@ -250,7 +250,7 @@ func TestSetCacheMutations_RunAIStreamerEnvVars(t *testing.T) {
 		KubeClient: attachmentClientForWorkspace(t, ws),
 	}
 	spec := &corev1.PodSpec{
-		Containers: []corev1.Container{{Name: "model"}},
+		Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
 	}
 
 	modifier := SetCacheMutations()
@@ -300,7 +300,7 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 		Containers: []corev1.Container{
 			{
 				Name:  "model",
-				Image: "vllm:latest",
+				Image: "kaito-base:latest",
 				Env: []corev1.EnvVar{
 					{Name: "HF_TOKEN", Value: "secret"},
 					{Name: "CUDA_VISIBLE_DEVICES", Value: "0,1"},

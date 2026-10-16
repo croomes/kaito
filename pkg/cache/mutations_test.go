@@ -73,8 +73,9 @@ func TestApplyMutations(t *testing.T) {
 	spec := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name: "model",
-				Env:  []corev1.EnvVar{{Name: "EXISTING", Value: "yes"}},
+				Name:  "model",
+				Image: "registry.example/kaito-base:v1",
+				Env:   []corev1.EnvVar{{Name: "EXISTING", Value: "yes"}},
 			},
 		},
 	}
@@ -89,9 +90,6 @@ func TestApplyMutations(t *testing.T) {
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "cache-vol", MountPath: "/cache"},
 		},
-		InitContainers: []corev1.Container{
-			{Name: "cache-init"},
-		},
 	}
 
 	applyMutations(spec, mutations)
@@ -105,8 +103,30 @@ func TestApplyMutations(t *testing.T) {
 	if len(spec.Volumes) != 1 {
 		t.Errorf("expected 1 volume, got %d", len(spec.Volumes))
 	}
-	if len(spec.InitContainers) != 1 {
-		t.Errorf("expected 1 init container, got %d", len(spec.InitContainers))
+}
+
+func TestApplyMutations_TargetsMatchingContainers(t *testing.T) {
+	spec := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{Name: "sidecar", Image: "registry.example/sidecar:v1"},
+			{Name: "model-a", Image: "registry.example/kaito-base:v1"},
+			{Name: "model-b", Image: "registry.example/kaito-base:v2"},
+		},
+	}
+	mutations := &PodMutations{
+		EnvVars:      []corev1.EnvVar{{Name: "CACHE_ENABLED", Value: "true"}},
+		VolumeMounts: []corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}},
+	}
+
+	applyMutations(spec, mutations)
+
+	if len(spec.Containers[0].Env) != 0 || len(spec.Containers[0].VolumeMounts) != 0 {
+		t.Error("expected sidecar to remain unchanged")
+	}
+	for i := 1; i < len(spec.Containers); i++ {
+		if len(spec.Containers[i].Env) != 1 || len(spec.Containers[i].VolumeMounts) != 1 {
+			t.Errorf("expected cache mutations on container %q", spec.Containers[i].Name)
+		}
 	}
 }
 
@@ -121,6 +141,62 @@ func TestApplyMutations_EmptyContainers(t *testing.T) {
 
 	if len(spec.Containers) != 0 {
 		t.Errorf("expected no containers modified")
+	}
+}
+
+func TestMutationEntryPoints_InvalidOpportunisticAttachmentSkip(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	ws := &kaitov1beta1.Workspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "workspace",
+			Namespace: "inference",
+			Annotations: map[string]string{
+				ConfigAnnotation: "cache-attachment",
+			},
+		},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-attachment", Namespace: "inference"},
+		Data: map[string]string{
+			ConfigKey: "modelWeights:\n  provider: dacs\n  mode: Opportunistic\n  unknown: value\n",
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).Build()
+	generatorContext := &generator.WorkspaceGeneratorContext{
+		Ctx:        context.Background(),
+		Workspace:  ws,
+		KubeClient: kubeClient,
+	}
+
+	spec := &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
+	}
+	if err := SetCacheMutations()(generatorContext, spec); err != nil {
+		t.Fatalf("SetCacheMutations() error = %v", err)
+	}
+	if len(spec.Containers[0].Env) != 0 || len(spec.Volumes) != 0 {
+		t.Fatal("invalid Opportunistic attachment must not mutate the pod spec")
+	}
+
+	ss := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: *spec.DeepCopy()},
+		},
+	}
+	if err := SetCachePodTemplateLabels()(generatorContext, ss); err != nil {
+		t.Fatalf("SetCachePodTemplateLabels() error = %v", err)
+	}
+	if err := ApplyTemplateCacheMutations(context.Background(), ws, kubeClient, ss); err != nil {
+		t.Fatalf("ApplyTemplateCacheMutations() error = %v", err)
+	}
+	if len(ss.Spec.Template.Labels) != 0 ||
+		len(ss.Spec.Template.Spec.Containers[0].Env) != 0 ||
+		len(ss.Spec.Template.Spec.Volumes) != 0 {
+		t.Fatal("invalid Opportunistic attachment must not mutate the StatefulSet")
 	}
 }
 
@@ -390,9 +466,10 @@ func TestApplyTemplateCacheMutations_AppliesLabelsAndEnvVars(t *testing.T) {
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name: "model",
-						Args: []string{"--load-format=runai_streamer", "--model=az://acct/container/model"},
-						Env:  []corev1.EnvVar{{Name: "EXISTING", Value: "keep"}},
+						Name:  "model",
+						Image: "kaito-base:latest",
+						Args:  []string{"--load-format=runai_streamer", "--model=az://acct/container/model"},
+						Env:   []corev1.EnvVar{{Name: "EXISTING", Value: "keep"}},
 					}},
 				},
 			},
@@ -424,7 +501,7 @@ func TestApplyTemplateCacheMutations_AppliesLabelsAndEnvVars(t *testing.T) {
 // newTemplateSS builds a StatefulSet whose single container optionally loads the
 // model via the run:ai streamer, for exercising the cache-applicability gate.
 func newTemplateSS(usesRunaiStreamer bool) *appsv1.StatefulSet {
-	c := corev1.Container{Name: "model"}
+	c := corev1.Container{Name: "model", Image: "kaito-base:latest"}
 	if usesRunaiStreamer {
 		c.Args = []string{"--load-format=runai_streamer", "--model=az://acct/container/model"}
 	} else {
@@ -634,6 +711,15 @@ func (m *mockDefaultConfigProvider) PodMutations(_ context.Context, _ CacheConce
 }
 func (m *mockDefaultConfigProvider) DefaultConfig(concern string) map[string]string {
 	return m.defaults
+}
+
+func TestMapsEqual_DifferentEmptyValueKeys(t *testing.T) {
+	if mapsEqual(
+		map[string]string{"oldOption": ""},
+		map[string]string{"newOption": ""},
+	) {
+		t.Fatal("maps with different keys must not be equal")
+	}
 }
 
 // TestBuildRuntimeConfigMap_SkipsUnchanged verifies that buildRuntimeConfigMap

@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package noop provides a no-op cache provider for testing and disabled mode.
+// Package noop provides a no-op cache provider for testing.
 package noop
 
 import (
@@ -26,7 +26,7 @@ import (
 const ProviderName = "noop"
 
 // Provider is a no-op cache provider that always reports available and ready
-// but performs no actual caching. Used for testing and as a fallback.
+// but performs no actual caching.
 type Provider struct{}
 
 var _ cache.Provider = (*Provider)(nil)
