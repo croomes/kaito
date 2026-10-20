@@ -154,7 +154,6 @@ type Provider struct {
 
 var _ cache.Provider = (*Provider)(nil)
 var _ cache.EventTarget = (*Provider)(nil)
-var _ cache.DefaultConfigProvider = (*Provider)(nil)
 var _ cache.ParameterValidator = (*Provider)(nil)
 
 // New creates a DACS cache provider with the given dynamic client and config.
@@ -313,22 +312,6 @@ func (p *Provider) EventObject() runtime.Object {
 		return nil
 	}
 	return p.cacheObj
-}
-
-// DefaultConfig returns Helm-value defaults for the given concern, used
-// as the base layer when merging with attachment parameters.
-func (p *Provider) DefaultConfig(concern string) map[string]string {
-	defaults := map[string]string{
-		"discoveryEndpoint": p.config.DiscoveryEndpoint,
-		"provider":          ProviderName,
-	}
-	switch concern {
-	case "model":
-		// No model-specific defaults needed (model path is user-specified via az:// in workspace YAML).
-	case "kv":
-		defaults["kvConnectorProtocol"] = p.config.KVConnectorProtocol
-	}
-	return defaults
 }
 
 // PodMutations returns the pod-level changes needed for the requested cache concern.

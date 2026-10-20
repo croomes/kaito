@@ -154,34 +154,6 @@ func TestIsAvailable(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigProvider(t *testing.T) {
-	cfg := Config{
-		DiscoveryEndpoint:   "discovery.example",
-		KVCacheEnabled:      true,
-		KVConnectorProtocol: "rdma",
-	}
-	p := New(newFakeProvider().client, cfg)
-
-	modelDefaults := p.DefaultConfig("model")
-	if modelDefaults["provider"] != ProviderName {
-		t.Fatalf("provider: got %q, want %q", modelDefaults["provider"], ProviderName)
-	}
-	if modelDefaults["discoveryEndpoint"] != cfg.DiscoveryEndpoint {
-		t.Fatalf("discoveryEndpoint: got %q, want %q", modelDefaults["discoveryEndpoint"], cfg.DiscoveryEndpoint)
-	}
-
-	kvDefaults := p.DefaultConfig("kv")
-	if kvDefaults["provider"] != ProviderName {
-		t.Fatalf("provider: got %q, want %q", kvDefaults["provider"], ProviderName)
-	}
-	if kvDefaults["discoveryEndpoint"] != cfg.DiscoveryEndpoint {
-		t.Fatalf("discoveryEndpoint: got %q, want %q", kvDefaults["discoveryEndpoint"], cfg.DiscoveryEndpoint)
-	}
-	if kvDefaults["kvConnectorProtocol"] != cfg.KVConnectorProtocol {
-		t.Fatalf("kvConnectorProtocol: got %q, want %q", kvDefaults["kvConnectorProtocol"], cfg.KVConnectorProtocol)
-	}
-}
-
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("DACS_DISCOVERY_ENDPOINT", "env-discovery.example")
 	t.Setenv("DACS_KV_CACHE_ENABLED", "false")
