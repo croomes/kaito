@@ -46,6 +46,15 @@ func ReconcileCache(ctx context.Context, kubeClient client.Client, ws *kaitov1be
 		return ReconcileResult{}
 	}
 
+	// Compute cache conditions separately and merge only their final states into
+	// the Workspace status, avoiding False -> True -> False transition churn.
+	cacheStatus := &kaitov1beta1.WorkspaceStatus{}
+	defer func() {
+		for _, condition := range cacheStatus.Conditions {
+			meta.SetStatusCondition(&status.Conditions, condition)
+		}
+	}()
+
 	result := ReconcileResult{}
 	attachment, err := ResolveEffectiveAttachment(ctx, kubeClient, ws)
 	if err != nil {
@@ -59,7 +68,7 @@ func ReconcileCache(ctx context.Context, kubeClient client.Client, ws *kaitov1be
 	// Check model weights cache readiness
 	if config := attachment.ModelWeights; config != nil && config.Mode != ModeDisabled {
 		ready, reason := checkProviderReady(ctx, CacheConcernModelWeights, config)
-		setCacheCondition(status, ws.GetGeneration(),
+		setCacheCondition(cacheStatus, ws.GetGeneration(),
 			kaitov1beta1.WorkspaceConditionTypeModelCacheReady, ready, reason)
 
 		// Required mode blocks deployment until the cache is ready — indefinitely.
@@ -72,7 +81,7 @@ func ReconcileCache(ctx context.Context, kubeClient client.Client, ws *kaitov1be
 	// Check KV cache readiness
 	if config := attachment.KVCache; config != nil && config.Mode != ModeDisabled {
 		ready, reason := checkProviderReady(ctx, CacheConcernKVCache, config)
-		setCacheCondition(status, ws.GetGeneration(),
+		setCacheCondition(cacheStatus, ws.GetGeneration(),
 			kaitov1beta1.WorkspaceConditionTypeKVCacheReady, ready, reason)
 
 		// Required mode blocks deployment until the cache is ready — indefinitely.
@@ -103,7 +112,7 @@ func ReconcileCache(ctx context.Context, kubeClient client.Client, ws *kaitov1be
 				"workspace", ws.Name, "error", err)
 			return result
 		}
-		verifyCacheInjection(ctx, ws, attachment, ss, status)
+		verifyCacheInjection(ctx, ws, attachment, ss, cacheStatus)
 	}
 
 	return result
@@ -156,8 +165,8 @@ func conditionIsTrue(status *kaitov1beta1.WorkspaceStatus, condType kaitov1beta1
 
 // concernInjected reports whether the provider's mutations for a concern are
 // actually present on the rendered pod template. It recomputes model-independent
-// mutations through collectMutations and confirms any provider-declared labels
-// landed on the workload.
+// mutations through collectMutations and confirms the expected labels, env vars,
+// volumes, and volume mounts landed on the workload.
 func concernInjected(ctx context.Context, ws *kaitov1beta1.Workspace,
 	attachment *Attachment, concern CacheConcern, ss *appsv1.StatefulSet) (bool, string) {
 
@@ -182,6 +191,54 @@ func concernInjected(ctx context.Context, ws *kaitov1beta1.Workspace,
 	for k, v := range m.Labels {
 		if ss.Spec.Template.Labels[k] != v {
 			return false, fmt.Sprintf("expected cache label %q not present on inference pod", k)
+		}
+	}
+
+	volumeNames := make(map[string]struct{}, len(ss.Spec.Template.Spec.Volumes))
+	for _, volume := range ss.Spec.Template.Spec.Volumes {
+		volumeNames[volume.Name] = struct{}{}
+	}
+	for _, expected := range m.Volumes {
+		if _, ok := volumeNames[expected.Name]; !ok {
+			return false, fmt.Sprintf("expected cache volume %q not present on inference pod", expected.Name)
+		}
+	}
+
+	if len(m.EnvVars) > 0 || len(m.VolumeMounts) > 0 {
+		targetFound := false
+		for _, container := range ss.Spec.Template.Spec.Containers {
+			if !isCacheContainer(container.Image) {
+				continue
+			}
+			targetFound = true
+
+			envNames := make(map[string]struct{}, len(container.Env))
+			for _, env := range container.Env {
+				envNames[env.Name] = struct{}{}
+			}
+			for _, expected := range m.EnvVars {
+				if _, ok := envNames[expected.Name]; !ok {
+					return false, fmt.Sprintf(
+						"expected cache env var %q not present on inference container %q",
+						expected.Name, container.Name)
+				}
+			}
+
+			mountNames := make(map[string]struct{}, len(container.VolumeMounts))
+			for _, mount := range container.VolumeMounts {
+				mountNames[mount.Name] = struct{}{}
+			}
+			for _, expected := range m.VolumeMounts {
+				if _, ok := mountNames[expected.Name]; !ok {
+					return false, fmt.Sprintf(
+						"expected cache volume mount %q not present on inference container %q",
+						expected.Name, container.Name)
+				}
+			}
+		}
+
+		if !targetFound {
+			return false, "no cache-target inference container found"
 		}
 	}
 

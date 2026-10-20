@@ -15,6 +15,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -33,7 +36,37 @@ import (
 const (
 	defaultCacheContainerImages = "kaito-base"
 	cacheContainerImageRegexEnv = "CACHE_CONTAINER_IMAGE_REGEX"
+	MutationHashAnnotation      = "kaito.sh/cache-mutation-hash"
 )
+
+type mutationHashInput struct {
+	Attachment *Attachment   `json:"attachment"`
+	Mutations  *PodMutations `json:"mutations"`
+}
+
+func setMutationHash(ss *appsv1.StatefulSet, attachment *Attachment, mutations *PodMutations) error {
+	data, err := json.Marshal(mutationHashInput{
+		Attachment: attachment,
+		Mutations:  mutations,
+	})
+	if err != nil {
+		return fmt.Errorf("marshalling cache mutation hash input: %w", err)
+	}
+
+	sum := sha256.Sum256(data)
+	if ss.Spec.Template.Annotations == nil {
+		ss.Spec.Template.Annotations = make(map[string]string)
+	}
+	ss.Spec.Template.Annotations[MutationHashAnnotation] = hex.EncodeToString(sum[:])
+	return nil
+}
+
+// MutationHashChanged reports whether the desired cache configuration differs
+// from the configuration rendered on the existing workload.
+func MutationHashChanged(existing, desired *appsv1.StatefulSet) bool {
+	return existing.Spec.Template.Annotations[MutationHashAnnotation] !=
+		desired.Spec.Template.Annotations[MutationHashAnnotation]
+}
 
 func isCacheContainer(image string) bool {
 	if pattern := os.Getenv(cacheContainerImageRegexEnv); pattern != "" {
@@ -65,12 +98,12 @@ func providerAppliesTo(p Provider, concern CacheConcern, ws *kaitov1beta1.Worksp
 	return checker.AppliesTo(concern, ws, ss)
 }
 
-// SetCacheMutations returns a pod spec modifier that injects cache provider
-// env vars, volumes, and volume mounts into the inference pod.
+// SetCacheMutations returns a StatefulSet modifier that evaluates provider
+// applicability against the rendered workload and applies all cache mutations.
 // Returns nil (no modifier) when cache is not configured. Callers are expected
 // to gate on the distributed-cache feature flag before wiring this modifier in.
-func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, corev1.PodSpec] {
-	return func(ctx *generator.WorkspaceGeneratorContext, spec *corev1.PodSpec) error {
+func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, appsv1.StatefulSet] {
+	return func(ctx *generator.WorkspaceGeneratorContext, ss *appsv1.StatefulSet) error {
 		ws := ctx.Workspace
 		if !HasAttachment(ws) {
 			return nil
@@ -102,12 +135,10 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 			}
 		}
 
-		mutations, err := collectMutations(ctx.Ctx, ws, attachment, modelName, modelRevision, workloadFromPodSpec(spec))
+		mutations, err := collectMutations(ctx.Ctx, ws, attachment, modelName, modelRevision, ss)
 		if err != nil {
 			return fmt.Errorf("collecting cache mutations: %w", err)
 		}
-
-		mountAttachmentParameters(ctx.Ctx, ctx.KubeClient, ws, attachment, mutations)
 
 		klog.InfoS("Cache mutations collected",
 			"workspace", ws.Name,
@@ -119,8 +150,17 @@ func SetCacheMutations() generator.TypedManifestModifier[generator.WorkspaceGene
 			klog.V(4).InfoS("  cache env var", "name", env.Name, "value", env.Value)
 		}
 
-		applyMutations(spec, mutations)
-		return nil
+		if len(mutations.Labels) > 0 {
+			if ss.Spec.Template.Labels == nil {
+				ss.Spec.Template.Labels = make(map[string]string)
+			}
+			for k, v := range mutations.Labels {
+				ss.Spec.Template.Labels[k] = v
+			}
+		}
+
+		applyMutations(&ss.Spec.Template.Spec, mutations)
+		return setMutationHash(ss, attachment, mutations)
 	}
 }
 
@@ -301,172 +341,9 @@ func applyMutations(spec *corev1.PodSpec, mutations *PodMutations) {
 
 }
 
-// mountAttachmentParameters merges attachment parameters with provider defaults,
-// creates runtime ConfigMaps, and mounts them for providers that consume files.
-func mountAttachmentParameters(ctx context.Context, kubeClient client.Client, ws *kaitov1beta1.Workspace, attachment *Attachment, mutations *PodMutations) {
-	if kubeClient == nil {
-		return
-	}
-
-	if config := attachment.ModelWeights; config != nil && config.Mode != ModeDisabled {
-		runtimeCM := buildRuntimeConfigMap(ctx, kubeClient, ws,
-			config.Parameters, config.Provider, "model")
-		if runtimeCM != "" {
-			volName := "cache-model-config"
-			mutations.Volumes = append(mutations.Volumes, corev1.Volume{
-				Name: volName,
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{Name: runtimeCM},
-					},
-				},
-			})
-			mutations.VolumeMounts = append(mutations.VolumeMounts, corev1.VolumeMount{
-				Name:      volName,
-				MountPath: "/etc/kaito/cache/model",
-				ReadOnly:  true,
-			})
-		}
-	}
-
-	if config := attachment.KVCache; config != nil && config.Mode != ModeDisabled {
-		runtimeCM := buildRuntimeConfigMap(ctx, kubeClient, ws,
-			config.Parameters, config.Provider, "kv")
-		if runtimeCM != "" {
-			volName := "cache-kv-config"
-			mutations.Volumes = append(mutations.Volumes, corev1.Volume{
-				Name: volName,
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{Name: runtimeCM},
-					},
-				},
-			})
-			mutations.VolumeMounts = append(mutations.VolumeMounts, corev1.VolumeMount{
-				Name:      volName,
-				MountPath: "/etc/kaito/cache/kv",
-				ReadOnly:  true,
-			})
-		}
-	}
-}
-
-// buildRuntimeConfigMap merges provider Helm defaults with attachment parameters,
-// creates/updates a runtime ConfigMap named "cache-<concern>-<workspace>", and returns
-// the runtime ConfigMap name (or empty string on failure).
-func buildRuntimeConfigMap(ctx context.Context, kubeClient client.Client,
-	ws *kaitov1beta1.Workspace, parameters map[string]string, providerName ProviderName, concern string) string {
-
-	// Start with provider Helm defaults (from registered provider config).
-	merged := make(map[string]string)
-	p, err := Get(providerName)
-	if err == nil {
-		if dc, ok := p.(DefaultConfigProvider); ok {
-			for k, v := range dc.DefaultConfig(concern) {
-				merged[k] = v
-			}
-		}
-	}
-
-	for k, v := range parameters {
-		merged[k] = v
-	}
-
-	if len(merged) == 0 {
-		return ""
-	}
-
-	// Create/update the runtime ConfigMap.
-	runtimeName := fmt.Sprintf("cache-%s-%s", concern, ws.Name)
-	runtimeCM := &corev1.ConfigMap{}
-	runtimeCM.Name = runtimeName
-	runtimeCM.Namespace = ws.Namespace
-	runtimeCM.Labels = map[string]string{
-		"kaito.sh/cache-config": "true",
-		"kaito.sh/workspace":    ws.Name,
-	}
-	runtimeCM.Data = merged
-
-	existing := &corev1.ConfigMap{}
-	if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: runtimeName}, existing); err != nil {
-		// Create
-		if err := kubeClient.Create(ctx, runtimeCM); err != nil {
-			klog.V(2).InfoS("Failed to create runtime cache ConfigMap", "name", runtimeName, "error", err)
-			return ""
-		}
-	} else {
-		// Update only if data changed.
-		if !mapsEqual(existing.Data, merged) {
-			existing.Data = merged
-			if err := kubeClient.Update(ctx, existing); err != nil {
-				klog.V(2).InfoS("Failed to update runtime cache ConfigMap", "name", runtimeName, "error", err)
-				return ""
-			}
-		}
-	}
-
-	return runtimeName
-}
-
-// SetCachePodTemplateLabels returns a StatefulSet modifier that adds cache-related
-// labels to the pod template metadata. This enables webhook-based injection where
-// the cache provider's mutating webhook detects the label and injects necessary
-// volumes, mounts, and environment variables.
-func SetCachePodTemplateLabels() generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, appsv1.StatefulSet] {
-	return func(ctx *generator.WorkspaceGeneratorContext, ss *appsv1.StatefulSet) error {
-		ws := ctx.Workspace
-		if !HasAttachment(ws) {
-			return nil
-		}
-		attachment, err := ResolveEffectiveAttachment(ctx.Ctx, ctx.KubeClient, ws)
-		if err != nil {
-			return fmt.Errorf("resolving cache attachment: %w", err)
-		}
-		if attachment == nil {
-			return nil
-		}
-
-		var modelName, modelRevision string
-		if ctx.Model != nil {
-			params := ctx.Model.GetInferenceParameters()
-			if params != nil {
-				modelName = params.Name
-				if params.Version != "" {
-					_, revision, err := utils.ParseHuggingFaceModelVersion(params.Version)
-					if err == nil {
-						modelRevision = revision
-					}
-				}
-				if modelName == "" && ws.Inference != nil && ws.Inference.Preset != nil {
-					modelName = string(ws.Inference.Preset.Name)
-				}
-			}
-		}
-
-		mutations, err := collectMutations(ctx.Ctx, ws, attachment, modelName, modelRevision, ss)
-		if err != nil {
-			return fmt.Errorf("collecting cache label mutations: %w", err)
-		}
-
-		if mutations != nil && len(mutations.Labels) > 0 {
-			if ss.Spec.Template.Labels == nil {
-				ss.Spec.Template.Labels = make(map[string]string)
-			}
-			for k, v := range mutations.Labels {
-				ss.Spec.Template.Labels[k] = v
-			}
-			klog.InfoS("Cache pod template labels applied",
-				"workspace", ws.Name,
-				"labels", mutations.Labels)
-		}
-
-		return nil
-	}
-}
-
 // ApplyTemplateCacheMutations applies cache mutations (labels, env vars, volumes)
 // to a StatefulSet generated from a custom pod template. This is the equivalent
-// of SetCacheMutations + SetCachePodTemplateLabels for the template inference path.
+// of SetCacheMutations for the template inference path.
 // Returns an error when cache mode is Required and mutations cannot be collected.
 //
 // Whether a configured provider actually engages with this workload is decided by
@@ -495,8 +372,6 @@ func ApplyTemplateCacheMutations(ctx context.Context, ws *kaitov1beta1.Workspace
 	if mutations == nil {
 		return nil
 	}
-
-	mountAttachmentParameters(ctx, kubeClient, ws, attachment, mutations)
 
 	klog.InfoS("Cache mutations applied to template inference",
 		"workspace", ws.Name,
@@ -527,32 +402,4 @@ func attachmentRequires(attachment *Attachment) bool {
 	return attachment != nil &&
 		((attachment.ModelWeights != nil && attachment.ModelWeights.Mode == ModeRequired) ||
 			(attachment.KVCache != nil && attachment.KVCache.Mode == ModeRequired))
-}
-
-// workloadFromPodSpec wraps an in-progress PodSpec in a minimal StatefulSet so
-// providers can evaluate applicability against the actual workload (containers,
-// args, volumes) from the PodSpec-level mutation path, which does not otherwise
-// have the enclosing StatefulSet available.
-func workloadFromPodSpec(spec *corev1.PodSpec) *appsv1.StatefulSet {
-	if spec == nil {
-		return nil
-	}
-	return &appsv1.StatefulSet{
-		Spec: appsv1.StatefulSetSpec{
-			Template: corev1.PodTemplateSpec{Spec: *spec},
-		},
-	}
-}
-
-// mapsEqual returns true if two string maps have identical keys and values.
-func mapsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if other, exists := b[k]; !exists || other != v {
-			return false
-		}
-	}
-	return true
 }

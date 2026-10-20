@@ -763,15 +763,16 @@ func (c *WorkspaceReconciler) applyInference(ctx context.Context, wObj *kaitov1b
 
 	currentRevisionStr, ok := annotations[kaitov1beta1.WorkspaceRevisionAnnotation]
 	baseImageUpgrade := shouldUpgradeBaseImage(wObj, existingObj, desiredStatefulSet)
+	replacePodTemplate := baseImageUpgrade || cache.MutationHashChanged(existingObj, desiredStatefulSet)
 
 	// If the current workload revision matches the one in Workspace and no upgrade is pending,
 	// we do not need to update it.
-	if ok && currentRevisionStr == revisionStr && !baseImageUpgrade {
+	if ok && currentRevisionStr == revisionStr && !replacePodTemplate {
 		return nil
 	}
 
-	if baseImageUpgrade {
-		// On base image upgrade, update all mutable fields of the StatefulSet
+	if replacePodTemplate {
+		// Replace the pod template for changes that require a workload rollout.
 		// https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/apps/validation/validation.go#L268C1-L269C1
 		existingObj.Spec.Template = desiredStatefulSet.Spec.Template
 		existingObj.Spec.Replicas = desiredStatefulSet.Spec.Replicas

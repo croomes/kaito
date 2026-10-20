@@ -108,13 +108,6 @@ type PodApplicabilityChecker interface {
 	AppliesTo(concern CacheConcern, workspace *kaitov1beta1.Workspace, ss *appsv1.StatefulSet) bool
 }
 
-// DefaultConfigProvider is an optional interface providers can implement to
-// supply Helm-value defaults for a given concern. These defaults are merged
-// with user-provided attachment parameters (user values override defaults).
-type DefaultConfigProvider interface {
-	DefaultConfig(concern string) map[string]string
-}
-
 // ParameterValidator is implemented by providers that accept attachment
 // parameters. It must reject unknown or invalid values for the given concern.
 type ParameterValidator interface {

@@ -72,6 +72,49 @@ func TestReconcileCache_NoopProvider_Opportunistic(t *testing.T) {
 	}
 }
 
+func TestReconcileCache_PreservesTransitionTimeWhenFinalStatusIsUnchanged(t *testing.T) {
+	isolateProviderRegistry(t)
+	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
+	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
+
+	Register(&concernTestProvider{name: "inject-test"})
+	ws := modelCacheWorkspace()
+	kubeClient := attachTestConfig(t, ws, modelCacheAttachment("inject-test"))
+	if err := appsv1.AddToScheme(kubeClient.Scheme()); err != nil {
+		t.Fatalf("add apps API to test scheme: %v", err)
+	}
+
+	transitionTime := metav1.NewTime(time.Unix(100, 0))
+	status := &kaitov1beta1.WorkspaceStatus{
+		Conditions: []metav1.Condition{{
+			Type:               string(kaitov1beta1.WorkspaceConditionTypeModelCacheReady),
+			Status:             metav1.ConditionFalse,
+			Reason:             "CacheNotReady",
+			Message:            "inference workload not yet created",
+			ObservedGeneration: ws.GetGeneration(),
+			LastTransitionTime: transitionTime,
+		}},
+	}
+
+	result := ReconcileCache(context.Background(), kubeClient, ws, status)
+	if result.BlockDeployment {
+		t.Fatal("Opportunistic cache should not block deployment")
+	}
+
+	cond := meta.FindStatusCondition(status.Conditions,
+		string(kaitov1beta1.WorkspaceConditionTypeModelCacheReady))
+	if cond == nil {
+		t.Fatal("expected ModelCacheReady condition")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected final condition False while workload is absent, got %s", cond.Status)
+	}
+	if !cond.LastTransitionTime.Time.Equal(transitionTime.Time) {
+		t.Fatalf("transition time changed without a final status transition: got %v, want %v",
+			cond.LastTransitionTime, transitionTime)
+	}
+}
+
 func TestReconcileCache_UnregisteredProvider_Required(t *testing.T) {
 	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
@@ -212,6 +255,22 @@ func (p *noopTestProvider) PodMutations(_ context.Context, _ CacheConcern, _ *ka
 	return &PodMutations{}, nil
 }
 
+type fixedMutationProvider struct {
+	name      ProviderName
+	mutations *PodMutations
+}
+
+func (p *fixedMutationProvider) Name() string { return string(p.name) }
+func (p *fixedMutationProvider) IsAvailable(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+func (p *fixedMutationProvider) IsReady(_ context.Context, _ string) (bool, string, error) {
+	return true, "ready", nil
+}
+func (p *fixedMutationProvider) PodMutations(_ context.Context, _ CacheConcern, _ *kaitov1beta1.Workspace, _, _ string, _ map[string]string) (*PodMutations, error) {
+	return p.mutations, nil
+}
+
 // stsWithPodLabels builds a minimal StatefulSet whose pod template carries the
 // given labels (and optional container args), for exercising injection
 // verification against a rendered workload.
@@ -222,7 +281,11 @@ func stsWithPodLabels(name, namespace string, podLabels map[string]string, args 
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "main", Args: args}},
+					Containers: []corev1.Container{{
+						Name:  "main",
+						Image: "kaito-base:latest",
+						Args:  args,
+					}},
 				},
 			},
 		},
@@ -274,6 +337,7 @@ func TestVerifyCacheInjection_InjectedLabelPresent_StaysReady(t *testing.T) {
 
 	// concernTestProvider injects Labels{"model-label":"enabled"} for model weights.
 	ss := stsWithPodLabels("ws", "default", map[string]string{"model-label": "enabled"})
+	ss.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "MODEL_ENV", Value: "weights"}}
 
 	status := &kaitov1beta1.WorkspaceStatus{}
 	setCacheCondition(status, ws.GetGeneration(), kaitov1beta1.WorkspaceConditionTypeModelCacheReady, true, "infra ready")
@@ -362,12 +426,12 @@ func TestVerifyCacheInjection_EmptyMutations_Downgrades(t *testing.T) {
 	}
 }
 
-func TestVerifyCacheInjection_KVPresenceInjected_StaysReady(t *testing.T) {
+func TestVerifyCacheInjection_KVEnvMissing_Downgrades(t *testing.T) {
 	isolateProviderRegistry(t)
 	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
-	// concernTestProvider injects only EnvVars (no labels) for KV cache.
+	// concernTestProvider expects KV_ENV, but the rendered container is missing it.
 	Register(&concernTestProvider{name: "kv-test"})
 	ws := &kaitov1beta1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{Name: "ws", Namespace: "default", CreationTimestamp: metav1.Now()},
@@ -382,8 +446,97 @@ func TestVerifyCacheInjection_KVPresenceInjected_StaysReady(t *testing.T) {
 	verifyCacheInjection(context.Background(), ws, attachment, ss, status)
 
 	cond := meta.FindStatusCondition(status.Conditions, string(kaitov1beta1.WorkspaceConditionTypeKVCacheReady))
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected KVCacheReady downgraded to False when KV env is missing, got %#v", cond)
+	}
+	if !strings.Contains(cond.Message, `expected cache env var "KV_ENV"`) {
+		t.Errorf("expected missing-env reason, got %q", cond.Message)
+	}
+}
+
+func TestVerifyCacheInjection_KVEnvPresent_StaysReady(t *testing.T) {
+	isolateProviderRegistry(t)
+	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
+	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
+
+	Register(&concernTestProvider{name: "kv-test"})
+	ws := modelCacheWorkspace()
+	attachment := &Attachment{KVCache: &ConcernConfig{Provider: "kv-test", Mode: ModeOpportunistic}}
+	ss := stsWithPodLabels("ws", "default", nil)
+	ss.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "KV_ENV", Value: "user-override"}}
+
+	status := &kaitov1beta1.WorkspaceStatus{}
+	setCacheCondition(status, ws.GetGeneration(), kaitov1beta1.WorkspaceConditionTypeKVCacheReady, true, "infra ready")
+
+	verifyCacheInjection(context.Background(), ws, attachment, ss, status)
+
+	cond := meta.FindStatusCondition(status.Conditions, string(kaitov1beta1.WorkspaceConditionTypeKVCacheReady))
 	if cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("expected KVCacheReady to stay True when KV env injected, got %#v", cond)
+		t.Fatalf("expected KVCacheReady to stay True when KV env is present, got %#v", cond)
+	}
+}
+
+func TestVerifyCacheInjection_VolumeAndMountPresence(t *testing.T) {
+	tests := []struct {
+		name        string
+		volumes     []corev1.Volume
+		mounts      []corev1.VolumeMount
+		wantReady   bool
+		wantMessage string
+	}{
+		{
+			name:        "missing volume",
+			mounts:      []corev1.VolumeMount{{Name: "cache-client", MountPath: "/cache"}},
+			wantMessage: `expected cache volume "cache-client"`,
+		},
+		{
+			name:        "missing mount",
+			volumes:     []corev1.Volume{{Name: "cache-client"}},
+			wantMessage: `expected cache volume mount "cache-client"`,
+		},
+		{
+			name:      "volume and mount present",
+			volumes:   []corev1.Volume{{Name: "cache-client"}},
+			mounts:    []corev1.VolumeMount{{Name: "cache-client", MountPath: "/custom-cache"}},
+			wantReady: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateProviderRegistry(t)
+			Register(&fixedMutationProvider{
+				name: "volume-test",
+				mutations: &PodMutations{
+					Volumes:      []corev1.Volume{{Name: "cache-client"}},
+					VolumeMounts: []corev1.VolumeMount{{Name: "cache-client", MountPath: "/cache"}},
+				},
+			})
+
+			ws := modelCacheWorkspace()
+			attachment := modelCacheAttachment("volume-test")
+			ss := stsWithPodLabels("ws", "default", nil)
+			ss.Spec.Template.Spec.Volumes = tt.volumes
+			ss.Spec.Template.Spec.Containers[0].VolumeMounts = tt.mounts
+
+			status := &kaitov1beta1.WorkspaceStatus{}
+			setCacheCondition(status, ws.GetGeneration(),
+				kaitov1beta1.WorkspaceConditionTypeModelCacheReady, true, "infra ready")
+
+			verifyCacheInjection(context.Background(), ws, attachment, ss, status)
+
+			cond := meta.FindStatusCondition(status.Conditions,
+				string(kaitov1beta1.WorkspaceConditionTypeModelCacheReady))
+			if cond == nil {
+				t.Fatal("expected ModelCacheReady condition")
+			}
+			if got := cond.Status == metav1.ConditionTrue; got != tt.wantReady {
+				t.Fatalf("ready = %v, want %v; condition = %#v", got, tt.wantReady, cond)
+			}
+			if tt.wantMessage != "" && !strings.Contains(cond.Message, tt.wantMessage) {
+				t.Errorf("expected reason containing %q, got %q", tt.wantMessage, cond.Message)
+			}
+		})
 	}
 }
 

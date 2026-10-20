@@ -282,9 +282,6 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 	// run:ai streamer, while a mount-based provider may apply unconditionally. The
 	// framework does not hardcode any such condition here.
 	cacheApplicable := featuregates.FeatureGates[consts.FeatureFlagDistributedCache] && cache.HasAttachment(workspaceObj)
-	if cacheApplicable {
-		podOpts = append(podOpts, cache.SetCacheMutations())
-	}
 
 	ssOpts := []generator.TypedManifestModifier[generator.WorkspaceGeneratorContext, appsv1.StatefulSet]{
 		manifests.GenerateStatefulSetManifest(revisionNum, numNodes),
@@ -322,11 +319,10 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 
 	ssOpts = append(ssOpts, manifests.SetStatefulSetPodSpec(podSpec))
 
-	// Add cache pod template labels (for webhook-based injection). This runs after
-	// the pod spec is attached so provider applicability checks can inspect the
-	// fully-rendered workload (containers, args, volumes).
+	// Evaluate provider applicability and apply all cache mutations after the
+	// complete pod spec has been attached to the StatefulSet.
 	if cacheApplicable {
-		ssOpts = append(ssOpts, cache.SetCachePodTemplateLabels())
+		ssOpts = append(ssOpts, cache.SetCacheMutations())
 	}
 
 	workload, err := generator.GenerateManifest(gctx, ssOpts...)

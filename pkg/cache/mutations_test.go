@@ -22,7 +22,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -66,6 +65,50 @@ func TestMergeMutations_NilSrc(t *testing.T) {
 
 	if len(dst.EnvVars) != 1 {
 		t.Fatalf("expected 1 env var, got %d", len(dst.EnvVars))
+	}
+}
+
+func TestMutationHashChanged(t *testing.T) {
+	attachment := &Attachment{
+		ModelWeights: &ConcernConfig{
+			Provider:   "test",
+			Mode:       ModeOpportunistic,
+			Parameters: map[string]string{"cacheName": "cache-a"},
+		},
+	}
+	mutations := &PodMutations{
+		EnvVars: []corev1.EnvVar{{Name: "CACHE_ENABLED", Value: "true"}},
+	}
+
+	existing := &appsv1.StatefulSet{}
+	desired := &appsv1.StatefulSet{}
+	if err := setMutationHash(existing, attachment, mutations); err != nil {
+		t.Fatalf("setMutationHash(existing) returned error: %v", err)
+	}
+	if err := setMutationHash(desired, attachment, mutations); err != nil {
+		t.Fatalf("setMutationHash(desired) returned error: %v", err)
+	}
+	if MutationHashChanged(existing, desired) {
+		t.Fatal("identical cache configuration reported as changed")
+	}
+
+	changedAttachment := &Attachment{
+		ModelWeights: &ConcernConfig{
+			Provider:   "test",
+			Mode:       ModeOpportunistic,
+			Parameters: map[string]string{"cacheName": "cache-b"},
+		},
+	}
+	if err := setMutationHash(desired, changedAttachment, mutations); err != nil {
+		t.Fatalf("setMutationHash(changed desired) returned error: %v", err)
+	}
+	if !MutationHashChanged(existing, desired) {
+		t.Fatal("changed cache attachment was not detected")
+	}
+
+	delete(desired.Spec.Template.Annotations, MutationHashAnnotation)
+	if !MutationHashChanged(existing, desired) {
+		t.Fatal("removed cache attachment was not detected")
 	}
 }
 
@@ -172,30 +215,33 @@ func TestMutationEntryPoints_InvalidOpportunisticAttachmentSkip(t *testing.T) {
 		KubeClient: kubeClient,
 	}
 
-	spec := &corev1.PodSpec{
-		Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
+	ss := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
+				},
+			},
+		},
 	}
-	if err := SetCacheMutations()(generatorContext, spec); err != nil {
+	if err := SetCacheMutations()(generatorContext, ss); err != nil {
 		t.Fatalf("SetCacheMutations() error = %v", err)
 	}
-	if len(spec.Containers[0].Env) != 0 || len(spec.Volumes) != 0 {
+	if len(ss.Spec.Template.Spec.Containers[0].Env) != 0 || len(ss.Spec.Template.Spec.Volumes) != 0 {
 		t.Fatal("invalid Opportunistic attachment must not mutate the pod spec")
 	}
 
-	ss := &appsv1.StatefulSet{
+	templateSS := &appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
-			Template: corev1.PodTemplateSpec{Spec: *spec.DeepCopy()},
+			Template: *ss.Spec.Template.DeepCopy(),
 		},
 	}
-	if err := SetCachePodTemplateLabels()(generatorContext, ss); err != nil {
-		t.Fatalf("SetCachePodTemplateLabels() error = %v", err)
-	}
-	if err := ApplyTemplateCacheMutations(context.Background(), ws, kubeClient, ss); err != nil {
+	if err := ApplyTemplateCacheMutations(context.Background(), ws, kubeClient, templateSS); err != nil {
 		t.Fatalf("ApplyTemplateCacheMutations() error = %v", err)
 	}
-	if len(ss.Spec.Template.Labels) != 0 ||
-		len(ss.Spec.Template.Spec.Containers[0].Env) != 0 ||
-		len(ss.Spec.Template.Spec.Volumes) != 0 {
+	if len(templateSS.Spec.Template.Labels) != 0 ||
+		len(templateSS.Spec.Template.Spec.Containers[0].Env) != 0 ||
+		len(templateSS.Spec.Template.Spec.Volumes) != 0 {
 		t.Fatal("invalid Opportunistic attachment must not mutate the StatefulSet")
 	}
 }
@@ -381,6 +427,22 @@ func (p *streamerScopedProvider) AppliesTo(_ CacheConcern, _ *kaitov1beta1.Works
 	return false
 }
 
+type labelScopedProvider struct {
+	concernTestProvider
+	applicabilityCalls int
+	mutationCalls      int
+}
+
+func (p *labelScopedProvider) AppliesTo(_ CacheConcern, _ *kaitov1beta1.Workspace, ss *appsv1.StatefulSet) bool {
+	p.applicabilityCalls++
+	return ss != nil && ss.Spec.Template.Labels["workload-label"] == "enabled"
+}
+
+func (p *labelScopedProvider) PodMutations(ctx context.Context, concern CacheConcern, ws *kaitov1beta1.Workspace, modelName, modelRevision string, parameters map[string]string) (*PodMutations, error) {
+	p.mutationCalls++
+	return p.concernTestProvider.PodMutations(ctx, concern, ws, modelName, modelRevision, parameters)
+}
+
 func TestCollectMutations_WithBothConcernsMergesLabelsAndEnvVars(t *testing.T) {
 	isolateProviderRegistry(t)
 
@@ -421,12 +483,14 @@ func TestCollectMutations_WithBothConcernsMergesLabelsAndEnvVars(t *testing.T) {
 	}
 }
 
-func TestSetCachePodTemplateLabels_ModifierAppliesLabels(t *testing.T) {
+func TestSetCacheMutations_AppliesLabels(t *testing.T) {
 	isolateProviderRegistry(t)
 	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
 
-	provider := &concernTestProvider{name: "concern-test"}
+	provider := &labelScopedProvider{
+		concernTestProvider: concernTestProvider{name: "concern-test"},
+	}
 	Register(provider)
 
 	ws := &kaitov1beta1.Workspace{}
@@ -438,13 +502,32 @@ func TestSetCachePodTemplateLabels_ModifierAppliesLabels(t *testing.T) {
 		Workspace:  ws,
 		KubeClient: kubeClient,
 	}
-	ss := &appsv1.StatefulSet{}
+	ss := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"workload-label": "enabled"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
+				},
+			},
+		},
+	}
 
-	if err := SetCachePodTemplateLabels()(ctx, ss); err != nil {
+	if err := SetCacheMutations()(ctx, ss); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if ss.Spec.Template.Labels["model-label"] != "enabled" {
 		t.Fatalf("expected pod template label to be applied, got %v", ss.Spec.Template.Labels)
+	}
+	if len(ss.Spec.Template.Spec.Containers[0].Env) != 1 ||
+		ss.Spec.Template.Spec.Containers[0].Env[0].Name != "MODEL_ENV" {
+		t.Fatalf("expected cache env var to be applied, got %v", ss.Spec.Template.Spec.Containers[0].Env)
+	}
+	if provider.applicabilityCalls != 1 || provider.mutationCalls != 1 {
+		t.Fatalf("expected one applicability and mutation call, got applicability=%d mutations=%d",
+			provider.applicabilityCalls, provider.mutationCalls)
 	}
 }
 
@@ -587,175 +670,5 @@ func TestApplyTemplateCacheMutations_AppliesWhenProviderApplicable(t *testing.T)
 	}
 	if ss.Spec.Template.Labels["model-label"] != "enabled" {
 		t.Fatalf("expected cache label when provider is applicable, got %v", ss.Spec.Template.Labels)
-	}
-}
-
-func TestMountAttachmentParameters_ModelWeights(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	// Register a mock provider with DefaultConfig
-	Register(&mockDefaultConfigProvider{name: "example", defaults: map[string]string{
-		"key1":     "default1",
-		"key3":     "default3",
-		"endpoint": "discovery.svc:9065",
-	}})
-	defer func() {
-		mu.Lock()
-		delete(providers, "example")
-		mu.Unlock()
-	}()
-
-	ws := &kaitov1beta1.Workspace{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-ws", Namespace: "default"},
-	}
-	attachment := &Attachment{ModelWeights: &ConcernConfig{
-		Provider: "example",
-		Mode:     ModeOpportunistic,
-		Parameters: map[string]string{
-			"key1": "userval1",
-			"key2": "userval2",
-		},
-	}}
-
-	mutations := &PodMutations{}
-	mountAttachmentParameters(context.Background(), kubeClient, ws, attachment, mutations)
-
-	// Verify a volume was added
-	if len(mutations.Volumes) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(mutations.Volumes))
-	}
-	if mutations.Volumes[0].Name != "cache-model-config" {
-		t.Errorf("expected volume name 'cache-model-config', got %q", mutations.Volumes[0].Name)
-	}
-
-	// Verify a volume mount was added
-	if len(mutations.VolumeMounts) != 1 {
-		t.Fatalf("expected 1 volumeMount, got %d", len(mutations.VolumeMounts))
-	}
-	if mutations.VolumeMounts[0].MountPath != "/etc/kaito/cache/model" {
-		t.Errorf("expected mountPath '/etc/kaito/cache/model', got %q", mutations.VolumeMounts[0].MountPath)
-	}
-
-	// Verify the runtime ConfigMap was created with merged data
-	runtimeCM := &corev1.ConfigMap{}
-	err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "cache-model-test-ws"}, runtimeCM)
-	if err != nil {
-		t.Fatalf("runtime ConfigMap not created: %v", err)
-	}
-	// User value overrides default
-	if runtimeCM.Data["key1"] != "userval1" {
-		t.Errorf("expected key1='userval1' (user override), got %q", runtimeCM.Data["key1"])
-	}
-	// User-only key preserved
-	if runtimeCM.Data["key2"] != "userval2" {
-		t.Errorf("expected key2='userval2', got %q", runtimeCM.Data["key2"])
-	}
-	// Default-only key preserved
-	if runtimeCM.Data["key3"] != "default3" {
-		t.Errorf("expected key3='default3' (from defaults), got %q", runtimeCM.Data["key3"])
-	}
-}
-
-func TestMountAttachmentParameters_NilClient(t *testing.T) {
-	ws := &kaitov1beta1.Workspace{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-ws", Namespace: "default"},
-	}
-	mutations := &PodMutations{}
-	attachment := &Attachment{ModelWeights: &ConcernConfig{
-		Provider:   "example",
-		Parameters: map[string]string{"key": "value"},
-	}}
-	mountAttachmentParameters(context.Background(), nil, ws, attachment, mutations)
-	if len(mutations.Volumes) != 0 {
-		t.Error("expected no volumes when client is nil")
-	}
-}
-
-func TestMountAttachmentParameters_NoParameters(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	ws := &kaitov1beta1.Workspace{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-ws", Namespace: "default"},
-	}
-	mutations := &PodMutations{}
-	attachment := &Attachment{ModelWeights: &ConcernConfig{
-		Provider: "example",
-		Mode:     ModeOpportunistic,
-	}}
-	mountAttachmentParameters(context.Background(), kubeClient, ws, attachment, mutations)
-	if len(mutations.Volumes) != 0 {
-		t.Error("expected no volumes when parameters are empty")
-	}
-}
-
-// mockDefaultConfigProvider implements Provider + DefaultConfigProvider for testing
-type mockDefaultConfigProvider struct {
-	name     string
-	defaults map[string]string
-}
-
-func (m *mockDefaultConfigProvider) Name() string { return m.name }
-func (m *mockDefaultConfigProvider) IsAvailable(_ context.Context, _ string) (bool, error) {
-	return true, nil
-}
-func (m *mockDefaultConfigProvider) IsReady(_ context.Context, _ string) (bool, string, error) {
-	return true, "ready", nil
-}
-func (m *mockDefaultConfigProvider) PodMutations(_ context.Context, _ CacheConcern, _ *kaitov1beta1.Workspace, _, _ string, _ map[string]string) (*PodMutations, error) {
-	return &PodMutations{}, nil
-}
-func (m *mockDefaultConfigProvider) DefaultConfig(concern string) map[string]string {
-	return m.defaults
-}
-
-func TestMapsEqual_DifferentEmptyValueKeys(t *testing.T) {
-	if mapsEqual(
-		map[string]string{"oldOption": ""},
-		map[string]string{"newOption": ""},
-	) {
-		t.Fatal("maps with different keys must not be equal")
-	}
-}
-
-// TestBuildRuntimeConfigMap_SkipsUnchanged verifies that buildRuntimeConfigMap
-// does NOT update the runtime ConfigMap when the merged data is unchanged,
-// avoiding unnecessary API writes and watch-triggered reconciles.
-func TestBuildRuntimeConfigMap_SkipsUnchanged(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	ws := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{Name: "ws1", Namespace: "default"}}
-
-	name := buildRuntimeConfigMap(context.Background(), kubeClient, ws,
-		map[string]string{"discoveryEndpoint": "ep.example"}, ProviderName("example"), "model")
-	if name == "" {
-		t.Fatal("expected a runtime ConfigMap name")
-	}
-
-	key := client.ObjectKey{Namespace: "default", Name: name}
-	created := &corev1.ConfigMap{}
-	if err := kubeClient.Get(context.Background(), key, created); err != nil {
-		t.Fatalf("runtime ConfigMap not created: %v", err)
-	}
-	rvCreate := created.ResourceVersion
-
-	// Second identical call must NOT write (data unchanged) → resourceVersion stays the same.
-	if got := buildRuntimeConfigMap(context.Background(), kubeClient, ws,
-		map[string]string{"discoveryEndpoint": "ep.example"}, ProviderName("example"), "model"); got != name {
-		t.Fatalf("expected stable runtime CM name, got %q want %q", got, name)
-	}
-	updated := &corev1.ConfigMap{}
-	if err := kubeClient.Get(context.Background(), key, updated); err != nil {
-		t.Fatalf("runtime ConfigMap missing after update: %v", err)
-	}
-	if updated.ResourceVersion != rvCreate {
-		t.Errorf("expected no update (same resourceVersion), got %q want %q", updated.ResourceVersion, rvCreate)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -190,12 +191,18 @@ func TestSetCacheMutations_FullPipeline(t *testing.T) {
 					},
 				},
 			}
+			ss := &appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{Spec: *spec},
+				},
+			}
 
 			modifier := SetCacheMutations()
-			err := modifier(ctx, spec)
+			err := modifier(ctx, ss)
 			if err != nil {
 				t.Fatalf("SetCacheMutations returned error: %v", err)
 			}
+			spec = &ss.Spec.Template.Spec
 
 			// With CSI, no init containers or volumes should be injected.
 			if len(spec.InitContainers) != 0 {
@@ -252,12 +259,18 @@ func TestSetCacheMutations_RunAIStreamerEnvVars(t *testing.T) {
 	spec := &corev1.PodSpec{
 		Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
 	}
+	ss := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: *spec},
+		},
+	}
 
 	modifier := SetCacheMutations()
-	err := modifier(ctx, spec)
+	err := modifier(ctx, ss)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	spec = &ss.Spec.Template.Spec
 
 	envMap := map[string]string{}
 	for _, e := range spec.Containers[0].Env {
@@ -314,12 +327,18 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 			{Name: "weights"},
 		},
 	}
+	ss := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: *spec},
+		},
+	}
 
 	modifier := SetCacheMutations()
-	err := modifier(ctx, spec)
+	err := modifier(ctx, ss)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	spec = &ss.Spec.Template.Spec
 
 	// Verify existing init container is preserved.
 	if len(spec.InitContainers) != 1 {
@@ -355,9 +374,9 @@ func TestSetCacheMutations_PreservesExistingPodSpec(t *testing.T) {
 	}
 }
 
-// TestSetCachePodTemplateLabels verifies that the StatefulSet modifier
-// correctly applies labels from cache mutations to the pod template.
-func TestSetCachePodTemplateLabels(t *testing.T) {
+// TestSetCacheMutations_AppliesPodTemplateLabels verifies that the StatefulSet
+// modifier applies provider labels to the pod template.
+func TestSetCacheMutations_AppliesPodTemplateLabels(t *testing.T) {
 	setupCacheProvider()
 	featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = true
 	defer func() { featuregates.FeatureGates[consts.FeatureFlagDistributedCache] = false }()
@@ -391,26 +410,29 @@ func TestSetCachePodTemplateLabels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Use the appsv1 import indirectly through the modifier.
 			ctx := &generator.WorkspaceGeneratorContext{
 				Ctx:       context.Background(),
 				Workspace: tt.workspace,
 				Model:     &mockModel{name: "microsoft/phi-4"},
 			}
-
-			// Create a minimal StatefulSet-like structure to test label application.
-			// We test via collectMutations directly since SetCachePodTemplateLabels
-			// operates on appsv1.StatefulSet which requires the appsv1 import.
-			if !HasAttachment(tt.workspace) {
-				return
+			if HasAttachment(tt.workspace) {
+				ctx.KubeClient = attachmentClientForWorkspace(t, tt.workspace)
 			}
-			attachment := attachmentForTestWorkspace(t, tt.workspace)
-			mutations, err := collectMutations(ctx.Ctx, tt.workspace, attachment, "microsoft/phi-4", "main", nil)
-			if err != nil {
+
+			ss := &appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "model", Image: "kaito-base:latest"}},
+						},
+					},
+				},
+			}
+			if err := SetCacheMutations()(ctx, ss); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			hasLabel := mutations != nil && len(mutations.Labels) > 0 && mutations.Labels["cache.example.com/inject"] == "true"
+			hasLabel := ss.Spec.Template.Labels["cache.example.com/inject"] == "true"
 			if hasLabel != tt.expectLabel {
 				t.Errorf("label present: got %v, want %v", hasLabel, tt.expectLabel)
 			}
